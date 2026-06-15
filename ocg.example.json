@@ -5,8 +5,12 @@
   "verbose": false,
   "channels": {
     "telegram": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN_HERE"
+      "accounts": {
+        "default": {
+          "enabled": true,
+          "botToken": "YOUR_BOT_TOKEN_HERE"
+        }
+      }
     }
   }
 }

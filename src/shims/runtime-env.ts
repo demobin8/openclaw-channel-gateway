@@ -7,7 +7,7 @@
 
 // ── Logging ──────────────────────────────────────────────────────────────
 
-let _verbose = process.env.LITE_GATEWAY_VERBOSE === "1";
+let _verbose = process.env.OCG_VERBOSE === "1";
 
 export function setVerbose(v: boolean) {
   _verbose = v;
@@ -26,7 +26,7 @@ export function logVerbose(...args: unknown[]) {
 }
 
 export function logVerboseConsole(...args: unknown[]) {
-  console.log("[lite-gateway]", ...args);
+  console.log("[ocg]", ...args);
 }
 
 export function info(...args: unknown[]) {
@@ -34,7 +34,7 @@ export function info(...args: unknown[]) {
 }
 
 export function success(...args: unknown[]) {
-  console.log("[lite-gateway]", ...args);
+  console.log("[ocg]", ...args);
 }
 
 export function warn(...args: unknown[]) {
@@ -174,13 +174,13 @@ export async function retryAsync<T>(
 
 export function registerUncaughtExceptionHandler() {
   process.on("uncaughtException", (err) => {
-    console.error("[lite-gateway] Uncaught exception:", err);
+    console.error("[ocg] Uncaught exception:", err);
   });
 }
 
 export function registerUnhandledRejectionHandler() {
   process.on("unhandledRejection", (reason) => {
-    console.error("[lite-gateway] Unhandled rejection:", reason);
+    console.error("[ocg] Unhandled rejection:", reason);
   });
 }
 

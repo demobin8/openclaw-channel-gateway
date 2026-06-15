@@ -1,23 +1,23 @@
 {
-  "name": "lite-gateway",
+  "name": "ocg",
   "version": "1.0.0",
   "description": "OpenClaw IM channel gateway — bridge Telegram/Discord to any OpenAI-compatible agent API",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "lite-gateway": "bin/lite-gateway.cjs"
+    "ocg": "bin/ocg.cjs"
   },
   "files": [
     "dist",
     "bin",
-    "lite-gateway.example.json"
+    "ocg.example.json"
   ],
   "scripts": {
     "dev": "tsx --import ./src/loader.ts src/cli.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node --import ./dist/loader.js dist/cli.js",
-    "cli": "node bin/lite-gateway.cjs",
+    "cli": "node bin/ocg.cjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -38,7 +38,9 @@
     "node": ">=22.12"
   },
   "dependencies": {
-    "@openclaw/qqbot": "^2026.6.5",
+    "@dingtalk-real-ai/dingtalk-connector": "^0.8.23",
+    "@openclaw/qqbot": "^2026.6.6",
+    "@tencent-weixin/openclaw-weixin": "^2.4.4",
     "grammy": "^1.34.0",
     "openclaw": "^2026.6.0"
   },

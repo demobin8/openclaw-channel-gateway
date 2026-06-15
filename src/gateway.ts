@@ -2,7 +2,7 @@
  * Lite Gateway — Channel lifecycle (delegates to dynamic plugin loader).
  */
 
-import type { LiteGatewayChannelConfig } from "./config.js";
+import { loadConfig, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
 import {
   loadAllPlugins,
   startChannel as loadStartChannel,
@@ -10,7 +10,9 @@ import {
   stopAllChannels,
   listRunningChannels as loadListRunning,
   isChannelRunning,
+  listRunningAccounts,
 } from "./plugin-loader.js";
+import { startCallbackServer, stopCallbackServer, isCallbackServerRunning } from "./callback-server.js";
 
 // ── Public API ────────────────────────────────────────────────────────────
 
@@ -18,24 +20,15 @@ export async function ensurePluginsLoaded(): Promise<void> {
   await loadAllPlugins();
 }
 
+/**
+ * Start a single channel using its plugin's config adapter.
+ * The full config (OpenClaw format) is passed through.
+ */
 export async function startChannel(
   channelId: string,
-  config: LiteGatewayChannelConfig,
-): Promise<void> {
-  // Resolve token: config > env var (per-channel or legacy telegram)
-  const envKey = `LITE_GATEWAY_${channelId.toUpperCase()}_TOKEN`;
-  const token =
-    config.token ||
-    process.env[envKey] ||
-    (channelId === "telegram" ? process.env.LITE_GATEWAY_TELEGRAM_TOKEN : undefined) ||
-    "";
-
-  // Pass all config fields through (appId, clientSecret, etc.)
-  const extraCfg: Record<string, unknown> = { ...config };
-  delete (extraCfg as Record<string, unknown>)["enabled"];
-  if (token) extraCfg.token = token;
-
-  await loadStartChannel(channelId, token || "", extraCfg);
+  cfg: Record<string, unknown>,
+): Promise<string[]> {
+  return await loadStartChannel(channelId, cfg);
 }
 
 export async function stopChannel(channelId: string): Promise<void> {
@@ -44,10 +37,10 @@ export async function stopChannel(channelId: string): Promise<void> {
 
 export async function restartChannel(
   channelId: string,
-  config: LiteGatewayChannelConfig,
-): Promise<void> {
+  cfg: Record<string, unknown>,
+): Promise<string[]> {
   await stopChannel(channelId);
-  await startChannel(channelId, config);
+  return await startChannel(channelId, cfg);
 }
 
 export function getChannelStatus(channelId: string) {
@@ -62,26 +55,63 @@ export function listRunningChannels() {
     status: "running" as const,
     startedAt: 0,
     error: undefined as string | undefined,
-    stop: async () => { await loadStopChannel(id); },
+    stop: async () => {
+      await loadStopChannel(id);
+    },
   }));
 }
 
+export { listRunningAccounts, stopAllChannels as stopAll };
+
+/**
+ * Start all enabled channels from config.
+ * Each channel's plugin config adapter determines which accounts are enabled.
+ */
 export async function startAll(
-  channels: Record<string, LiteGatewayChannelConfig>,
-): Promise<Array<{ channelId: string; status: string; startedAt: number }>> {
+  rawCfg: LiteGatewayConfig,
+): Promise<
+  Array<{ channelId: string; accountId: string; status: string; startedAt: number }>
+> {
   await ensurePluginsLoaded();
 
-  const results: Array<{ channelId: string; status: string; startedAt: number }> = [];
-  for (const [id, cfg] of Object.entries(channels)) {
-    if (cfg.enabled === false) continue;
+  applyConfigEnvOverrides(rawCfg);
+
+  // Start callback server for async dispatch (only if not already running)
+  if (!isCallbackServerRunning()) {
+    const cbHost = rawCfg.callbackHost ?? "127.0.0.1";
+    const cbPort = rawCfg.callbackPort ?? 3457;
     try {
-      await startChannel(id, cfg);
-      results.push({ channelId: id, status: "running", startedAt: Date.now() });
+      await startCallbackServer(cbHost, cbPort);
     } catch (err) {
-      console.error(`[lite-gateway] Failed to start ${id}:`, (err as Error).message);
+      console.error(`[ocg] Failed to start callback server: ${(err as Error).message}`);
+    }
+  }
+
+  const cfg = buildOpenClawConfig(rawCfg);
+  const channelIds = Object.keys(rawCfg.channels ?? {});
+
+  const results: Array<{
+    channelId: string;
+    accountId: string;
+    status: string;
+    startedAt: number;
+  }> = [];
+
+  for (const id of channelIds) {
+    try {
+      const started = await loadStartChannel(id, cfg);
+      for (const runKey of started) {
+        const [chId, ...rest] = runKey.split(":");
+        results.push({
+          channelId: chId,
+          accountId: rest.join(":"),
+          status: "running",
+          startedAt: Date.now(),
+        });
+      }
+    } catch (err) {
+      console.error(`[ocg] Failed to start ${id}:`, (err as Error).message);
     }
   }
   return results;
 }
-
-export { stopAllChannels as stopAll };

@@ -1,5 +1,5 @@
 /**
- * End-to-end smoke test for lite-gateway dispatch pipeline.
+ * End-to-end smoke test for ocg dispatch pipeline.
  *
  * Starts a local HTTP server that mimics an OpenAI-compatible API,
  * then exercises the `dispatchReplyWithBufferedBlockDispatcher` shim
@@ -76,8 +76,8 @@ await serverStarted;
 
 // ── Configure dispatch ───────────────────────────────────────────────────
 
-process.env.LITE_GATEWAY_AGENT_URL = `http://127.0.0.1:${testPort}/v1/chat/completions`;
-process.env.LITE_GATEWAY_MODEL = "gpt-4o";
+process.env.OCG_AGENT_URL = `http://127.0.0.1:${testPort}/v1/chat/completions`;
+process.env.OCG_MODEL = "gpt-4o";
 
 // ── Run dispatch ─────────────────────────────────────────────────────────
 

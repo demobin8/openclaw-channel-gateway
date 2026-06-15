@@ -55,7 +55,7 @@ async function httpDispatch({
   const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
   const agentUrl =
     (liteGw.agentUrl as string) ||
-    process.env.LITE_GATEWAY_AGENT_URL ||
+    process.env.OCG_AGENT_URL ||
     "http://127.0.0.1:11434/v1/chat/completions";
 
   const model =
@@ -66,7 +66,7 @@ async function httpDispatch({
     typeof (cfg.agents as Record<string, unknown>).defaults === "object"
       ? ((cfg.agents as Record<string, unknown>).defaults as Record<string, unknown>).model
       : undefined) ||
-    process.env.LITE_GATEWAY_MODEL ||
+    process.env.OCG_MODEL ||
     "gpt-4o";
 
   // Some configs store model as a string, others as an object { primary: "..." }
@@ -75,11 +75,28 @@ async function httpDispatch({
       ? model
       : typeof model === "object" && model && typeof (model as Record<string, unknown>).primary === "string"
         ? (model as Record<string, string>).primary
-        : process.env.LITE_GATEWAY_MODEL || "gpt-4o";
+        : process.env.OCG_MODEL || "gpt-4o";
 
-  const apiKey = process.env.LITE_GATEWAY_API_KEY || "";
+  const apiKey = process.env.OCG_API_KEY || "";
 
-  console.log(`[lite-gateway] Dispatching from ${from} to ${modelStr} via ${agentUrl}`);
+  const verbose =
+    (liteGw.verbose as boolean) ||
+    process.env.OCG_VERBOSE === "1";
+
+  // ── Verbose: log incoming message ────────────────────────────────────
+  console.log(`\n${"=".repeat(60)}`);
+  console.log(`📥 [IN]  From: ${from}  |  Session: ${sessionKey}`);
+  if (verbose) {
+    console.log(`       Body (${body.length} chars):`);
+    const preview = body.length > 2000 ? body.slice(0, 2000) + "\n... (truncated)" : body;
+    console.log(preview.split("\n").map((l) => `       │ ${l}`).join("\n"));
+  } else {
+    const oneLiner = body.replace(/\n/g, "\\n");
+    const preview =
+      oneLiner.length > 200 ? oneLiner.slice(0, 200) + "..." : oneLiner;
+    console.log(`       Body: ${preview}`);
+  }
+  console.log(`       → ${modelStr} @ ${agentUrl}`);
 
   const { deliver, beforeDeliver, onModelSelected } = dispatcherOptions;
 
@@ -88,6 +105,37 @@ async function httpDispatch({
     await onModelSelected?.(modelStr);
   } catch {
     // Not critical
+  }
+
+  // ── Async (fire & forget) mode ──────────────────────────────────────
+  const isAsync = Boolean(liteGw.async);
+  if (isAsync && deliver) {
+    // Dynamically import callback-server to keep the module tree clean
+    // for sync-only users (they don't need the HTTP server dependency).
+    const { registerDeliver } = await import("../callback-server.js");
+
+    const callbackToken = registerDeliver(deliver);
+    const callbackUrl = (liteGw.callbackUrl as string) || `http://127.0.0.1:3457/ocg/callback`;
+
+    console.log(`[ocg] Async dispatch → agent, callbackToken=${callbackToken.slice(0, 8)}...`);
+
+    // Fire & forget — do NOT await
+    fetch(agentUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: modelStr,
+        messages: [{ role: "user", content: body }],
+        stream: false,
+        callback_url: callbackUrl,
+        callback_token: callbackToken,
+      }),
+      signal: AbortSignal.timeout(300_000),
+    }).catch((err: Error) => {
+      console.error(`[ocg] Async forward error: ${err.message}`);
+    });
+
+    return { queuedFinal: false, async: true, callbackToken };
   }
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -112,90 +160,164 @@ async function httpDispatch({
       throw new Error(`Agent API returned ${response.status}: ${errText.slice(0, 200)}`);
     }
 
-    // Stream SSE response
-    const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
+    const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
     let fullText = "";
     let blockIndex = 0;
     let finalDelivered = false;
     const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    if (contentType.includes("text/event-stream")) {
+      // ── SSE stream ──────────────────────────────────────────────────
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
 
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split("\n");
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
 
-        const data = trimmed.slice(5).trim();
-        if (data === "[DONE]") continue;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
 
-        try {
-          const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.delta?.content;
-          if (!content) continue;
+          const data = trimmed.slice(5).trim();
+          if (data === "[DONE]") continue;
 
-          fullText += content;
+          try {
+            const parsed = JSON.parse(data);
+            const content = parsed.choices?.[0]?.delta?.content;
+            if (!content) continue;
 
-          const payload = { text: content, isError: false };
+            fullText += content;
 
-          let finalPayload = payload;
-          if (beforeDeliver) {
-            const result = await beforeDeliver(payload, {
-              kind: "block",
-              assistantMessageIndex: blockIndex,
-            });
-            if (result === null) continue;
-            if (result) finalPayload = result as typeof finalPayload;
+            const payload = { text: content, isError: false };
+
+            let finalPayload = payload;
+            if (beforeDeliver) {
+              const result = await beforeDeliver(payload, {
+                kind: "block",
+                assistantMessageIndex: blockIndex,
+              });
+              if (result === null) continue;
+              if (result) finalPayload = result as typeof finalPayload;
+            }
+
+            if (deliver) {
+              await deliver(finalPayload, {
+                kind: "block",
+                assistantMessageIndex: blockIndex,
+              });
+              deliveredCounts.block++;
+            }
+            blockIndex++;
+          } catch {
+            // Skip unparseable SSE lines
           }
+        }
+      }
+    } else {
+      // ── Non-streaming JSON ──────────────────────────────────────────
+      const raw = await response.text();
+      if (verbose) {
+        console.log(`[ocg] Non-streaming response (${raw.length} chars): ${raw.slice(0, 500)}`);
+      }
 
-          if (deliver) {
-            await deliver(finalPayload, {
-              kind: "block",
-              assistantMessageIndex: blockIndex,
-            });
-            deliveredCounts.block++;
-          }
-          blockIndex++;
-        } catch {
-          // Skip unparseable SSE lines
+      try {
+        const parsed = JSON.parse(raw);
+        // Extract content from various JSON paths
+        let content =
+          parsed?.choices?.[0]?.message?.content ??
+          parsed?.choices?.[0]?.text ??
+          parsed?.content ??
+          parsed?.response ??
+          parsed?.output ??
+          raw;
+
+        if (typeof content !== "string") {
+          content = JSON.stringify(content);
+        }
+
+        fullText = content;
+
+        // Deliver as final (non-streaming has no blocks)
+        const finalPayload = { text: fullText, isError: false };
+
+        let finalToDeliver = finalPayload;
+        if (beforeDeliver) {
+          const result = await beforeDeliver(finalPayload, {
+            kind: "final",
+            assistantMessageIndex: 0,
+          });
+          if (result) finalToDeliver = result as typeof finalToDeliver;
+        }
+
+        if (deliver && finalToDeliver) {
+          await deliver(finalToDeliver, {
+            kind: "final",
+            assistantMessageIndex: 0,
+          });
+          deliveredCounts.final++;
+          finalDelivered = true;
+        }
+      } catch {
+        // Not valid JSON → treat as plain text
+        fullText = raw;
+        const finalPayload = { text: fullText, isError: false };
+        if (deliver) {
+          await deliver(finalPayload, {
+            kind: "final",
+            assistantMessageIndex: 0,
+          });
+          deliveredCounts.final++;
+          finalDelivered = true;
         }
       }
     }
 
-    // Deliver final payload
-    const finalPayload = { text: fullText, isError: false };
+    // Deliver final payload (only if not already delivered in non-streaming path)
+    if (!finalDelivered) {
+      const finalPayload = { text: fullText, isError: false };
 
-    let finalToDeliver = finalPayload;
-    if (beforeDeliver) {
-      const result = await beforeDeliver(finalPayload, {
-        kind: "final",
-        assistantMessageIndex: blockIndex,
-      });
-      if (result) finalToDeliver = result as typeof finalToDeliver;
+      let finalToDeliver = finalPayload;
+      if (beforeDeliver) {
+        const result = await beforeDeliver(finalPayload, {
+          kind: "final",
+          assistantMessageIndex: blockIndex,
+        });
+        if (result) finalToDeliver = result as typeof finalToDeliver;
+      }
+
+      if (deliver && finalToDeliver) {
+        await deliver(finalToDeliver, {
+          kind: "final",
+          assistantMessageIndex: blockIndex,
+        });
+        deliveredCounts.final++;
+        finalDelivered = true;
+      }
     }
 
-    if (deliver && finalToDeliver) {
-      await deliver(finalToDeliver, {
-        kind: "final",
-        assistantMessageIndex: blockIndex,
-      });
-      deliveredCounts.final++;
-      finalDelivered = true;
+    // ── Verbose: log outgoing response ─────────────────────────────────
+    console.log(`📤 [OUT] ${fullText.length} chars, ${deliveredCounts.block} blocks`);
+    if (verbose) {
+      const lines = fullText.split("\n");
+      for (const line of lines) {
+        console.log(`       │ ${line}`);
+      }
+    } else {
+      const oneLiner = fullText.replace(/\n/g, "\\n");
+      const preview =
+        oneLiner.length > 300 ? oneLiner.slice(0, 300) + "..." : oneLiner;
+      console.log(`       Text: ${preview}`);
     }
-
-    console.log(
-      `[lite-gateway] Dispatch complete: ${fullText.length} chars, ${deliveredCounts.block} blocks`,
-    );
+    console.log(`${"=".repeat(60)}\n`);
 
     return { queuedFinal: finalDelivered, counts: deliveredCounts };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[lite-gateway] Agent dispatch error: ${message}`);
+    console.error(`[ocg] Agent dispatch error: ${message}`);
 
     // Deliver error to the user
     if (deliver) {

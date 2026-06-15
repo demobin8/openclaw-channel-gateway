@@ -16,7 +16,7 @@ export type SessionScope = Record<string, unknown>;
 
 // ── File-based store ─────────────────────────────────────────────────────
 
-const DB_FILE = process.env.LITE_GATEWAY_SESSION_DB_PATH || "lite-gateway-sessions.json";
+const DB_FILE = process.env.OCG_SESSION_DB_PATH || "ocg-sessions.json";
 
 let _store: Map<string, SessionEntry> | null = null;
 
@@ -31,7 +31,7 @@ function ensureStore(): Map<string, SessionEntry> {
         _store.set(key, entry);
       }
     } catch (err) {
-      console.error(`[lite-gateway] Failed to load sessions: ${err}`);
+      console.error(`[ocg] Failed to load sessions: ${err}`);
     }
   }
   return _store;
@@ -47,7 +47,7 @@ function persistStore() {
     const entries = [..._store.entries()];
     writeFileSync(DB_FILE, JSON.stringify(entries, null, 2), "utf-8");
   } catch (err) {
-    console.error(`[lite-gateway] Failed to persist sessions: ${err}`);
+    console.error(`[ocg] Failed to persist sessions: ${err}`);
   }
 }
 
@@ -212,5 +212,5 @@ export function resolveAllAgentSessionStoreTargetsSync(): string[] {
 
 export function clearSessionStoreCacheForTest(): void {
   _store = null;
-  console.log("[lite-gateway] Session store cleared for test");
+  console.log("[ocg] Session store cleared for test");
 }

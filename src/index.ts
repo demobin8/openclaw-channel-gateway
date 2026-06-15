@@ -3,41 +3,56 @@
  *
  * A minimal OpenClaw channel gateway that bridges IM channels to any
  * OpenAI-compatible agent API via HTTP.
+ *
+ * Uses OpenClaw channel plugins directly — no code porting needed.
+ * Any bundled or external OpenClaw IM plugin works out of the box.
  */
 
-import { loadConfig, resolveConfigPath, type LiteGatewayConfig } from "./config.js";
+import { loadConfig, resolveConfigPath, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
 import { startAll, stopAll, listRunningChannels } from "./gateway.js";
+import { stopCallbackServer } from "./callback-server.js";
 
 export {
-  loadConfig, resolveConfigPath, saveConfig, addChannel, removeChannel,
-  listConfiguredChannels, listAllChannels,
+  loadConfig,
+  resolveConfigPath,
+  saveConfig,
+  addChannel,
+  removeChannel,
+  removeChannelAccount,
+  listConfiguredChannels,
+  listAllChannels,
+  getChannelSection,
+  buildOpenClawConfig,
 } from "./config.js";
-export type { LiteGatewayConfig, LiteGatewayChannelConfig } from "./config.js";
-export { startChannel, stopChannel, restartChannel, getChannelStatus, startAll, stopAll } from "./gateway.js";
-
-function applyEnv(cfg: LiteGatewayConfig): void {
-  if (cfg.verbose) process.env.LITE_GATEWAY_VERBOSE = "1";
-  if (cfg.agentUrl) process.env.LITE_GATEWAY_AGENT_URL = cfg.agentUrl;
-  if (cfg.model) process.env.LITE_GATEWAY_MODEL = cfg.model;
-  if (cfg.apiKey) process.env.LITE_GATEWAY_API_KEY = cfg.apiKey;
-}
+export type { LiteGatewayConfig } from "./config.js";
+export {
+  startChannel,
+  stopChannel,
+  restartChannel,
+  getChannelStatus,
+  startAll,
+  stopAll,
+  listRunningAccounts,
+} from "./gateway.js";
 
 export async function startGateway(): Promise<void> {
   const cfg = loadConfig();
-  if (!cfg) throw new Error("No config found. Create lite-gateway.json");
+  if (!cfg) throw new Error("No config found. Create ocg.json");
 
-  applyEnv(cfg);
+  applyConfigEnvOverrides(cfg);
 
-  const channels = cfg.channels ?? {};
-  const enabled = Object.entries(channels).filter(([, c]) => c?.enabled !== false);
-  if (enabled.length === 0) throw new Error("No channels enabled");
+  const channelIds = Object.keys(cfg.channels ?? {});
+  if (channelIds.length === 0) throw new Error("No channels configured");
 
-  const results = await startAll(channels);
-  console.log(`[lite-gateway] ${results.length} channel(s) running`);
+  const results = await startAll(cfg);
+  // startAll reports each account individually; dedupe by channel
+  const uniqueChannelIds = new Set(results.map((r) => r.channelId));
+  console.log(`[ocg] ${uniqueChannelIds.size} channel(s) running (${results.length} account(s))`);
 }
 
 export async function stopGateway(): Promise<void> {
   await stopAll();
+  await stopCallbackServer();
 }
 
 export function gatewayStatus(): Record<string, unknown> {
@@ -54,7 +69,7 @@ export function gatewayStatus(): Record<string, unknown> {
       uptime: b.startedAt ? Math.round((Date.now() - b.startedAt) / 1000) : 0,
       error: b.error,
     })),
-    agentUrl: cfg?.agentUrl || process.env.LITE_GATEWAY_AGENT_URL || "(not set)",
-    model: cfg?.model || process.env.LITE_GATEWAY_MODEL || "(not set)",
+    agentUrl: cfg?.agentUrl || process.env.OCG_AGENT_URL || "(not set)",
+    model: cfg?.model || process.env.OCG_MODEL || "(not set)",
   };
 }

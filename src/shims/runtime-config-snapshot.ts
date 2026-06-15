@@ -2,7 +2,7 @@
  * Lite gateway shim for `openclaw/plugin-sdk/runtime-config-snapshot`.
  *
  * Provides a simple in-memory config store that channel plugins read from.
- * The config is loaded from `lite-gateway.json` (in the working directory)
+ * The config is loaded from `ocg.json` (in the working directory)
  * rather than from `~/.openclaw/openclaw.json`.
  */
 
@@ -13,18 +13,18 @@ let _runtimeConfig: Record<string, unknown> | null = null;
 let _sourceConfig: Record<string, unknown> | null = null;
 let _configTime: number | null = null;
 
-const CONFIG_FILE = process.env.LITE_GATEWAY_CONFIG_PATH || "lite-gateway.json";
+const CONFIG_FILE = process.env.OCG_CONFIG_PATH || "ocg.json";
 
 function readConfigFile() {
   if (!existsSync(CONFIG_FILE)) {
-    console.log(`[lite-gateway] No config file at ${CONFIG_FILE}, using defaults`);
+    console.log(`[ocg] No config file at ${CONFIG_FILE}, using defaults`);
     return {};
   }
   try {
     const raw = readFileSync(CONFIG_FILE, "utf-8");
     return JSON.parse(raw);
   } catch (err) {
-    console.error(`[lite-gateway] Failed to parse ${CONFIG_FILE}: ${err}`);
+    console.error(`[ocg] Failed to parse ${CONFIG_FILE}: ${err}`);
     return {};
   }
 }
@@ -34,7 +34,7 @@ function loadConfig() {
   _configTime = Date.now();
   _sourceConfig = readConfigFile();
   _runtimeConfig = structuredClone(_sourceConfig) as Record<string, unknown>;
-  console.log(`[lite-gateway] Config loaded from ${CONFIG_FILE}`);
+  console.log(`[ocg] Config loaded from ${CONFIG_FILE}`);
 }
 
 /** Return the current runtime config snapshot. */

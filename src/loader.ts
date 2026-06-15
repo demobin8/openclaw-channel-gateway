@@ -1,5 +1,5 @@
 /**
- * ESM loader hook for lite-gateway.
+ * ESM loader hook for ocg.
  *
  * Two interception layers:
  *
@@ -39,8 +39,8 @@ const SHIM_PREFIX = "openclaw/plugin-sdk/";
 
 function isOwnShimCaller(parentURL: string | undefined): boolean {
   if (!parentURL) return false;
-  if (parentURL.includes("/lite-gateway/src/shims/")) return true;
-  if (parentURL.includes("/lite-gateway/dist/shims/")) return true;
+  if (parentURL.includes("/ocg/src/shims/")) return true;
+  if (parentURL.includes("/ocg/dist/shims/")) return true;
   return false;
 }
 

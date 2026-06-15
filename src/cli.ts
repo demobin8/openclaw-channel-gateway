@@ -2,19 +2,19 @@
  * Lite Gateway CLI — mirrors `openclaw channels` command surface.
  *
  * Usage:
- *   lite-gateway start                     启动全部
- *   lite-gateway stop                      停止全部
- *   lite-gateway restart                   重启全部
- *   lite-gateway status                    网关状态
- *   lite-gateway version                   版本
+ *   ocg start                     启动全部
+ *   ocg stop                      停止全部
+ *   ocg restart                   重启全部
+ *   ocg status                    网关状态
+ *   ocg version                   版本
  *
- *   lite-gateway channels list [--json]    列出 channels
- *   lite-gateway channels status [--channel <name>] [--json]
- *   lite-gateway channels start --channel <name>
- *   lite-gateway channels stop --channel <name>
- *   lite-gateway channels restart --channel <name>
- *   lite-gateway channels add --channel <name> [--token <token>] [--<key> <value> ...]
- *   lite-gateway channels remove --channel <name>
+ *   ocg channels list [--json]    列出 channels
+ *   ocg channels status [--channel <name>] [--json]
+ *   ocg channels start --channel <name>
+ *   ocg channels stop --channel <name>
+ *   ocg channels restart --channel <name>
+ *   ocg channels add --channel <name> [--token <token>] [--<key> <value> ...]
+ *   ocg channels remove --channel <name>
  */
 
 import {
@@ -22,12 +22,16 @@ import {
   stopGateway,
   gatewayStatus,
   loadConfig,
+  buildOpenClawConfig,
   addChannel,
   removeChannel,
+  getChannelSection,
   listConfiguredChannels,
   listAllChannels,
   resolveConfigPath,
 } from "./index.js";
+import { applyConfigEnvOverrides } from "./config.js";
+import { startCallbackServer, isCallbackServerRunning } from "./callback-server.js";
 import {
   startChannel,
   stopChannel,
@@ -40,6 +44,8 @@ import {
   loadChannelPlugin,
   discoverBundledPlugins,
   discoverExternalPlugins,
+  channelLoginStart,
+  channelLoginWait,
 } from "./plugin-loader.js";
 
 const VERSION = "1.0.0";
@@ -48,17 +54,18 @@ const VERSION = "1.0.0";
 
 function printBanner(): void {
   console.log(
-    "╔══════════════════════════════════════════════╗\n" +
-    "║       Lite Gateway v1.0.0                      ║\n" +
-    "║   OpenClaw IM bridge → External Agent API     ║\n" +
-    "╚══════════════════════════════════════════════╝",
+    "╔══════════════════════════════════════╗\n" +
+    "║         OCG  v1.0.0                    ║\n" +
+    "║   OpenClaw Channel Gateway            ║\n" +
+    "║   IM bridge → External Agent API      ║\n" +
+    "╚══════════════════════════════════════╝",
   );
 }
 
 function printHelp(): void {
   printBanner();
   console.log("");
-  console.log("Usage: lite-gateway <command> [options]");
+  console.log("Usage: ocg <command> [options]");
   console.log("");
   console.log("Commands:");
   console.log("  start                         Start all enabled channels");
@@ -73,18 +80,19 @@ function printHelp(): void {
   console.log("  channels start --channel <id>    Start a channel");
   console.log("  channels stop --channel <id>     Stop a channel");
   console.log("  channels restart --channel <id>  Restart a channel");
-  console.log("  channels add --channel <id> [--<k> <v> ...]  Add a channel");
+  console.log("  channels login --channel <id>    QR login (for WeChat, etc.)");
+  console.log("  channels add --channel <id> [--account <id>] [--<k> <v> ...]  Add a channel account");
   console.log("  channels remove --channel <id>   Remove a channel");
   console.log("");
   console.log("  plugins install <pkg>            Install a channel plugin (npm install)");
   console.log("  plugins list                     List installed channel plugins");
   console.log("");
   console.log("Environment:");
-  console.log("  LITE_GATEWAY_CONFIG_PATH     Config file path");
-  console.log("  LITE_GATEWAY_AGENT_URL       Agent API URL");
-  console.log("  LITE_GATEWAY_MODEL           Model name");
-  console.log("  LITE_GATEWAY_API_KEY         API key");
-  console.log("  LITE_GATEWAY_TELEGRAM_TOKEN  Telegram bot token");
+  console.log("  OCG_CONFIG_PATH     Config file path");
+  console.log("  OCG_AGENT_URL       Agent API URL");
+  console.log("  OCG_MODEL           Model name");
+  console.log("  OCG_API_KEY         API key");
+  console.log("  OCG_TELEGRAM_TOKEN  Telegram bot token");
 }
 
 // ── Arg parser (simple positional + flags, no Commander dependency) ────────
@@ -125,7 +133,7 @@ function parseArgs(raw: string[]): { command: string; args: Args } {
 async function cmdTest(): Promise<void> {
   const { createServer } = await import("node:http");
 
-  console.log("[lite-gateway] Running dispatch test...\n");
+  console.log("[ocg] Running dispatch test...\n");
 
   const body = JSON.stringify({
     id: "test-1",
@@ -158,9 +166,9 @@ async function cmdTest(): Promise<void> {
   await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
   console.log(`[mock-agent] Listening on http://127.0.0.1:${port}\n`);
 
-  process.env.LITE_GATEWAY_AGENT_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
-  process.env.LITE_GATEWAY_MODEL = "gpt-4o";
-  process.env.LITE_GATEWAY_API_KEY = "test-key";
+  process.env.OCG_AGENT_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
+  process.env.OCG_MODEL = "gpt-4o";
+  process.env.OCG_API_KEY = "test-key";
 
   const { dispatchReplyWithBufferedBlockDispatcher } =
     await import("./shims/reply-dispatch-runtime.js");
@@ -187,7 +195,7 @@ async function cmdTest(): Promise<void> {
   });
 
   console.log("─── Results ───\n");
-  console.log(`Model selected: ${process.env.LITE_GATEWAY_MODEL}`);
+  console.log(`Model selected: ${process.env.OCG_MODEL}`);
   console.log(`Collected blocks:`, collectedTexts);
   console.log(`Final text: ${finalText}`);
   console.log(`Result counts:`, result.counts);
@@ -196,7 +204,7 @@ async function cmdTest(): Promise<void> {
   console.log("\n─── Checks ───\n");
   const counts = result.counts as Record<string, number> | undefined;
   const checks = [
-    ["modelSelected === \"gpt-4o\"", process.env.LITE_GATEWAY_MODEL === "gpt-4o"],
+    ["modelSelected === \"gpt-4o\"", process.env.OCG_MODEL === "gpt-4o"],
     ["collectedTexts.length === 4", collectedTexts.length === 4],
     ["finalText === \"Hello from lite gateway!\"", finalText === "Hello from lite gateway!"],
     ["result.counts.block === 4", counts?.block === 4],
@@ -225,7 +233,7 @@ async function cmdStart(): Promise<void> {
 
 async function cmdStop(): Promise<void> {
   await stopGateway();
-  console.log("[lite-gateway] Stopped");
+  console.log("[ocg] Stopped");
 }
 
 async function cmdRestart(): Promise<void> {
@@ -257,7 +265,7 @@ async function cmdChannelsList(args: Args): Promise<void> {
   } else {
     if (ids.length === 0) {
       if (args["all"]) {
-        console.log("No channels in config. Use: lite-gateway channels add --channel <id> [--<key> <value> ...]");
+        console.log("No channels in config. Use: ocg channels add --channel <id> [--<key> <value> ...]");
       } else {
         console.log("No enabled channels. Use --all to show disabled channels.");
       }
@@ -290,14 +298,36 @@ async function cmdChannelsStart(args: Args): Promise<void> {
     process.exit(1);
   }
   await ensurePluginsLoaded();
-  const cfg = loadConfig();
-  const chCfg = cfg?.channels?.[channelId];
+  const rawCfg = loadConfig();
+  if (!rawCfg) {
+    console.error("No config found. Create ocg.json");
+    process.exit(1);
+  }
+  applyConfigEnvOverrides(rawCfg);
+
+  // Start callback server for async dispatch (only if not already running)
+  if (!isCallbackServerRunning()) {
+    const cbHost = rawCfg.callbackHost ?? "127.0.0.1";
+    const cbPort = rawCfg.callbackPort ?? 3457;
+    try {
+      await startCallbackServer(cbHost, cbPort);
+    } catch (err) {
+      console.error(`[ocg] Failed to start callback server: ${(err as Error).message}`);
+    }
+  }
+
+  const cfg = buildOpenClawConfig(rawCfg);
+  const chCfg = getChannelSection(channelId);
   if (!chCfg) {
     console.error(`Channel "${channelId}" not found in config`);
     process.exit(1);
   }
-  await startChannel(channelId, { ...chCfg, enabled: true });
-  console.log(`[lite-gateway] ${channelId} started`);
+  const started = await startChannel(channelId, cfg);
+  if (started.length === 0) {
+    console.log(`[ocg] ${channelId}: no enabled/configured accounts to start`);
+  } else {
+    for (const key of started) console.log(`[ocg] ${key} started`);
+  }
 }
 
 async function cmdChannelsStop(args: Args): Promise<void> {
@@ -307,7 +337,7 @@ async function cmdChannelsStop(args: Args): Promise<void> {
     process.exit(1);
   }
   await stopChannel(channelId);
-  console.log(`[lite-gateway] ${channelId} stopped`);
+  console.log(`[ocg] ${channelId} stopped`);
 }
 
 async function cmdChannelsRestart(args: Args): Promise<void> {
@@ -317,32 +347,58 @@ async function cmdChannelsRestart(args: Args): Promise<void> {
     process.exit(1);
   }
   await ensurePluginsLoaded();
-  const cfg = loadConfig();
-  const chCfg = cfg?.channels?.[channelId];
+  const rawCfg = loadConfig();
+  if (!rawCfg) {
+    console.error("No config found.");
+    process.exit(1);
+  }
+  applyConfigEnvOverrides(rawCfg);
+  const cfg = buildOpenClawConfig(rawCfg);
+  const chCfg = getChannelSection(channelId);
   if (!chCfg) {
     console.error(`Channel "${channelId}" not found in config`);
     process.exit(1);
   }
-  await restartChannel(channelId, { ...chCfg, enabled: true });
-  console.log(`[lite-gateway] ${channelId} restarted`);
+  const started = await restartChannel(channelId, cfg);
+  if (started.length === 0) {
+    console.log(`[ocg] ${channelId}: no enabled/configured accounts`);
+  } else {
+    for (const key of started) console.log(`[ocg] ${key} restarted`);
+  }
 }
 
 async function cmdChannelsAdd(args: Args): Promise<void> {
   const channelId = args["channel"] as string;
-  const token = (args["token"] as string) ?? "";
+  const accountId = (args["account"] as string) ?? "default";
+
   if (!channelId) {
     console.error(
-      "Usage: lite-gateway channels add --channel <id> [--token <token>] [--<key> <value> ...]",
+      "Usage: ocg channels add --channel <id> [--account <id>] [--<key> <value> ...]",
     );
+    console.error("Examples:");
+    console.error('  ocg channels add --channel telegram --botToken "123:abc"');
+    console.error('  ocg channels add --channel qqbot --token "AppID:AppSecret"');
+    console.error('  ocg channels add --channel discord --token "..." --account ops');
     process.exit(1);
   }
-  // Collect extra plugin-specific fields (appId, clientSecret, etc.)
-  const extra: Record<string, unknown> = {};
+  // Collect plugin-specific fields (everything except channel and account)
+  const fields: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args)) {
-    if (k !== "channel" && k !== "token") extra[k] = v;
+    if (k !== "channel" && k !== "account") fields[k] = v;
   }
-  addChannel(channelId, token, extra);
-  console.log(`[lite-gateway] Channel "${channelId}" added`);
+
+  // Parse qqbot token format: "AppID:AppSecret" → appId + clientSecret
+  if (channelId === "qqbot" && typeof fields.token === "string") {
+    const colon = fields.token.indexOf(":");
+    if (colon > 0) {
+      fields.appId = fields.token.slice(0, colon);
+      fields.clientSecret = fields.token.slice(colon + 1);
+      delete fields.token;
+    }
+  }
+
+  addChannel(channelId, accountId, fields);
+  console.log(`[ocg] Channel "${channelId}" account "${accountId}" added`);
 }
 
 async function cmdChannelsRemove(args: Args): Promise<void> {
@@ -352,26 +408,116 @@ async function cmdChannelsRemove(args: Args): Promise<void> {
     process.exit(1);
   }
   removeChannel(channelId);
-  console.log(`[lite-gateway] Channel "${channelId}" removed`);
+  console.log(`[ocg] Channel "${channelId}" removed`);
+}
+
+async function cmdChannelsLogin(args: Args): Promise<void> {
+  const channelId = args["channel"] as string;
+  if (!channelId) {
+    console.error("Usage: ocg channels login --channel <id>");
+    console.error("Example: ocg channels login --channel openclaw-weixin");
+    process.exit(1);
+  }
+  await ensurePluginsLoaded();
+  const rawCfg = loadConfig() ?? {};
+  const cfg = buildOpenClawConfig(rawCfg);
+
+  // Ensure the channel is in config (at least as a placeholder)
+  const chCfg = getChannelSection(channelId);
+  if (!chCfg) {
+    console.error(`Channel "${channelId}" not found in config. Add it first:`);
+    console.error(`  ocg channels add --channel ${channelId}`);
+    process.exit(1);
+  }
+
+  console.log(`[ocg] Starting QR login for ${channelId}...`);
+
+  // Step 1: Start QR login
+  const startResult = await channelLoginStart(channelId, {
+    cfg,
+    accountId: args["account"] ?? "default",
+    force: args["force"] ?? false,
+    verbose: args["verbose"] ?? false,
+  });
+
+  console.log(`[ocg] ${startResult.message ?? "Ready"}`);
+  if (startResult.qrDataUrl) {
+    // Render QR code directly in the terminal
+    try {
+      const qrcodeMod = await import("qrcode-terminal");
+      const qrcode = (qrcodeMod as any).default ?? qrcodeMod;
+      console.log("");
+      await new Promise<void>((resolve) => {
+        qrcode.generate(
+          startResult.qrDataUrl!,
+          { small: true },
+          (output: string) => {
+            console.log(output);
+            resolve();
+          },
+        );
+      });
+      const scanHint =
+        channelId === "dingtalk-connector"
+          ? "📱 Scan the QR code with DingTalk on your phone"
+          : "📱 Scan the QR code with WeChat on your phone";
+      console.log(`  ${scanHint}`);
+      console.log(`  🔗 ${startResult.qrDataUrl}\n`);
+    } catch {
+      // Fallback: open in browser
+      console.log(`\n  🔳  QR Code: ${startResult.qrDataUrl}\n`);
+      try {
+        const { exec } = await import("node:child_process");
+        const url = startResult.qrDataUrl!;
+        const plat = process.platform;
+        exec(plat === "win32" ? `start "" "${url}"` : plat === "darwin" ? `open "${url}"` : `xdg-open "${url}"`);
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Step 2: Wait for scan
+  console.log(`[ocg] Waiting for QR scan (timeout: 120s)...`);
+  const waitResult = await channelLoginWait(channelId, {
+    cfg,
+    sessionKey: startResult.sessionKey ?? "",
+    accountId: args["account"] ?? "default",
+    timeoutMs: 120_000,
+  });
+
+  if (waitResult.connected) {
+    const accountId = (args["account"] as string) ?? "default";
+    console.log(`[ocg] Login successful! Account: ${waitResult.accountId ?? accountId}`);
+
+    // If the login flow returned credentials (built-in auth handlers), save them
+    if (waitResult.credentials) {
+      addChannel(channelId, accountId, waitResult.credentials as Record<string, unknown>);
+      console.log(`[ocg] Credentials saved to config`);
+    }
+
+    console.log(`[ocg] Now start the channel: ocg channels start --channel ${channelId}`);
+  } else {
+    console.error(`[ocg] Login failed: ${waitResult.message ?? "timeout or cancelled"}`);
+    process.exit(1);
+  }
 }
 
 // ── Plugins ──────────────────────────────────────────────────────────────
 
 async function cmdPluginsInstall(pkg: string): Promise<void> {
   if (!pkg) {
-    console.error("Usage: lite-gateway plugins install <package>");
-    console.error("Example: lite-gateway plugins install @openclaw/qqbot");
+    console.error("Usage: ocg plugins install <package>");
+    console.error("Example: ocg plugins install @openclaw/qqbot");
     process.exit(1);
   }
-  console.log(`[lite-gateway] Installing ${pkg}...`);
+  console.log(`[ocg] Installing ${pkg}...`);
   const { execSync } = await import("node:child_process");
   const { dirname } = await import("node:path");
   const cwd = dirname(resolveConfigPath()) || ".";
   try {
     execSync(`npm install ${pkg}`, { cwd, stdio: "inherit" });
-    console.log(`[lite-gateway] ${pkg} installed.`);
+    console.log(`[ocg] ${pkg} installed.`);
   } catch {
-    console.error(`[lite-gateway] Failed to install ${pkg}`);
+    console.error(`[ocg] Failed to install ${pkg}`);
     process.exit(1);
   }
 
@@ -382,17 +528,17 @@ async function cmdPluginsInstall(pkg: string): Promise<void> {
     const loaded = await loadChannelPlugin(newPlugin);
     if (loaded) {
       console.log(
-        `[lite-gateway] Plugin "${newPlugin.id}" ready. ` +
-          `Add with: lite-gateway channels add --channel ${newPlugin.id} [--<key> <value> ...]`,
+        `[ocg] Plugin "${newPlugin.id}" ready. ` +
+          `Example: ocg channels add --channel ${newPlugin.id} --<key> <value>`,
       );
     } else {
       console.log(
-        `[lite-gateway] Plugin "${newPlugin.id}" found but could not be loaded. Check compatibility.`,
+        `[ocg] Plugin "${newPlugin.id}" found but could not be loaded. Check compatibility.`,
       );
     }
   } else {
     console.log(
-      `[lite-gateway] Installed but no channel metadata found for ${pkg}. ` +
+      `[ocg] Installed but no channel metadata found for ${pkg}. ` +
         `Check the package has "openclaw.channel" in package.json.`,
     );
   }
@@ -418,7 +564,7 @@ async function cmdPluginsList(): Promise<void> {
   console.log("External plugins (installed via npm):");
   if (external.length === 0) {
     console.log("  (none found)");
-    console.log("  Install: lite-gateway plugins install @openclaw/qqbot");
+    console.log("  Install: ocg plugins install @openclaw/qqbot");
   } else {
     for (const p of external) {
       const status = loaded.includes(p.id) ? "loaded" : "available";
@@ -427,7 +573,7 @@ async function cmdPluginsList(): Promise<void> {
   }
 
   console.log("");
-  console.log("To add a channel: lite-gateway channels add --channel <id> [--<key> <value> ...]");
+  console.log("To add a channel: ocg channels add --channel <id> [--account <id>] [--<key> <value> ...]");
 }
 
 // ── Main dispatch ─────────────────────────────────────────────────────────
@@ -438,14 +584,14 @@ async function run(): Promise<void> {
   // Flags-only invocations: --help, --version before positional dispatch
   if (args["help"] || args["h"]) return printHelp();
   if (args["version"] || args["v"]) {
-    console.log(`lite-gateway v${VERSION}`);
+    console.log(`ocg v${VERSION}`);
     return;
   }
 
   // Top-level commands
   if (!command || command === "help") return printHelp();
   if (command === "start") return cmdStart();
-  if (command === "version") { console.log(`lite-gateway v${VERSION}`); return; }
+  if (command === "version") { console.log(`ocg v${VERSION}`); return; }
 
   switch (command) {
     case "stop": return cmdStop();
@@ -463,10 +609,10 @@ async function run(): Promise<void> {
       return cmdPluginsInstall(pkg);
     }
     if (rest === "install") {
-      console.error("Usage: lite-gateway plugins install <package>");
+      console.error("Usage: ocg plugins install <package>");
       process.exit(1);
     }
-    console.log("Usage: lite-gateway plugins <install|list>");
+    console.log("Usage: ocg plugins <install|list>");
     process.exit(1);
   }
 
@@ -481,22 +627,23 @@ async function run(): Promise<void> {
       case "restart": return cmdChannelsRestart(args);
       case "add": return cmdChannelsAdd(args);
       case "remove": return cmdChannelsRemove(args);
+      case "login": return cmdChannelsLogin(args);
       default:
-        // `lite-gateway channels` with no subcommand
-        console.log("Usage: lite-gateway channels <subcommand>");
+        // `ocg channels` with no subcommand
+        console.log("Usage: ocg channels <subcommand>");
         console.log("  list, status, start, stop, restart, add, remove");
-        console.log("  lite-gateway channels --help  for details");
+        console.log("  ocg channels --help  for details");
         process.exit(1);
     }
   }
 
   // Unknown
   console.error(`Unknown command: ${command}`);
-  console.error("Use lite-gateway --help");
+  console.error("Use ocg --help");
   process.exit(1);
 }
 
 run().catch((err) => {
-  console.error("[lite-gateway] Fatal:", (err as Error).message);
+  console.error("[ocg] Fatal:", (err as Error).message);
   process.exit(1);
 });
