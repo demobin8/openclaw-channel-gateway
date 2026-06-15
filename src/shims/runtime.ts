@@ -162,7 +162,7 @@ function createReplyDispatcher(options: DispatcherOptions): Dispatcher {
     pending += 1;
     sendChain = sendChain
       .then(async () => {
-        let deliverPayload = payload;
+        let deliverPayload: Record<string, unknown> | null = payload;
         if (beforeDeliver) {
           deliverPayload = (await beforeDeliver(payload, { kind })) ?? null;
           if (!deliverPayload) {
@@ -533,7 +533,7 @@ async function dispatchReplyFromConfig(params: {
 // ── resolveStorePath (fallback) ──────────────────────────────────────────
 
 function resolveStorePath(
-  storeCfg: unknown,
+  storeCfg: string,
   opts: Record<string, unknown>,
 ): string {
   try {
@@ -550,7 +550,8 @@ function resolveStorePath(
 
 async function saveMediaBuffer(buffer: Buffer, opts: Record<string, unknown>): Promise<string> {
   try {
-    return await ocgSaveMediaBuffer(buffer, opts as { dir?: string; key?: string });
+    const key = (opts.key as string) || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return (await ocgSaveMediaBuffer(buffer, key as string)) as unknown as string;
   } catch {
     const dir = (opts.dir as string) || path.resolve(os.tmpdir(), "ocg-media");
     const fs = await import("node:fs/promises");

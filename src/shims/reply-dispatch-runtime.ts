@@ -120,9 +120,13 @@ async function httpDispatch({
     console.log(`[ocg] Async dispatch → agent, callbackToken=${callbackToken.slice(0, 8)}...`);
 
     // Fire & forget — do NOT await
+    const asyncHeaders: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) {
+      asyncHeaders["Authorization"] = `Bearer ${apiKey}`;
+    }
     fetch(agentUrl, {
       method: "POST",
-      headers,
+      headers: asyncHeaders,
       body: JSON.stringify({
         model: modelStr,
         messages: [{ role: "user", content: body }],
