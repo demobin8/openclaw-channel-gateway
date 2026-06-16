@@ -32,7 +32,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/demobin8/openclaw-channel-gateway"
+    "url": "git+https://github.com/demobin8/openclaw-channel-gateway.git"
+  },
+  "homepage": "https://github.com/demobin8/openclaw-channel-gateway#readme",
+  "bugs": {
+    "url": "https://github.com/demobin8/openclaw-channel-gateway/issues"
   },
   "engines": {
     "node": ">=22.12"
