@@ -18,14 +18,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - name: Try OIDC token exchange via npm
-        run: |
-          echo "=== Attempting npm token create via OIDC ==="
-          npm token create --registry https://registry.npmjs.org 2>&1 || true
-          echo "=== Exit code: $? ==="
+          node-version: 24
+          # DO NOT set registry-url here — it injects _authToken=${NODE_AUTH_TOKEN}
+          # into .npmrc, which short-circuits npm's OIDC Trusted Publishing code path
+          # and causes a misleading E404 on publish.
 
       - name: Install dependencies
         run: npm ci
@@ -34,4 +30,4 @@ jobs:
         run: npm run build
 
       - name: Publish to npm
-        run: npm publish --access public --provenance
+        run: npm publish --access public
