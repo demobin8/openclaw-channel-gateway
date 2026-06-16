@@ -39,9 +39,15 @@ OpenClaw 拥有最丰富的 IM 渠道生态（Telegram、Discord、微信、钉�
 └──────────────────────────────────────────────────────┘
 ```
 
-## 支持的 IM 渠道
+## IM 渠道
 
-所有 OpenClaw 支持的内置和外部 Channel 插件均可开箱即用：
+OCG 默认支持所有 OpenClaw 生态的 IM Channel 插件。任何带有 `"openclaw.channel"` 元数据的 npm 包都可以作为插件安装：
+
+```bash
+ocg plugins install <插件包名>
+```
+
+以下渠道已经过测试验证：
 
 | 渠道 | 插件包 | 类型 |
 |---|---|---|
@@ -51,22 +57,16 @@ OpenClaw 拥有最丰富的 IM 渠道生态（Telegram、Discord、微信、钉�
 | 钉钉 | `@dingtalk-real-ai/dingtalk-connector` | 外部 |
 | QQ | `@openclaw/qqbot` | 外部 |
 
-> 任何带有 `"openclaw.channel"` 元数据的 npm 包都可以作为插件安装。
-
 ## 快速开始
 
 ### 环境要求
 
 - **Node.js** >= 22.12
-- **npm** >= 9
 
 ### 安装
 
 ```bash
-git clone https://github.com/openclaw/openclaw-channel-gateway.git
-cd openclaw-channel-gateway
-npm install
-npm run build
+npm install -g openclaw-channel-gateway
 ```
 
 ### 配置
@@ -252,6 +252,3 @@ openclaw-channel-gateway/
 └── package.json
 ```
 
-## License
-
-MIT

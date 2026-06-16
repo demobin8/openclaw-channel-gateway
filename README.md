@@ -39,9 +39,15 @@ OpenClaw has the richest IM channel ecosystem (Telegram, Discord, WeChat, DingTa
 └──────────────────────────────────────────────────────┘
 ```
 
-## Supported IM Channels
+## IM Channels
 
-All OpenClaw bundled and external channel plugins work out of the box:
+OCG supports all OpenClaw ecosystem IM channel plugins by default. Any npm package with `"openclaw.channel"` metadata can be installed as a plugin:
+
+```bash
+ocg plugins install <plugin-package>
+```
+
+The following channels have been tested and verified:
 
 | Channel | Plugin Package | Type |
 |---|---|---|
@@ -51,22 +57,16 @@ All OpenClaw bundled and external channel plugins work out of the box:
 | DingTalk | `@dingtalk-real-ai/dingtalk-connector` | External |
 | QQ | `@openclaw/qqbot` | External |
 
-> Any npm package with `"openclaw.channel"` metadata can be installed as a plugin.
-
 ## Quick Start
 
 ### Prerequisites
 
 - **Node.js** >= 22.12
-- **npm** >= 9
 
 ### Installation
 
 ```bash
-git clone https://github.com/openclaw/openclaw-channel-gateway.git
-cd openclaw-channel-gateway
-npm install
-npm run build
+npm install -g openclaw-channel-gateway
 ```
 
 ### Configuration
@@ -252,6 +252,3 @@ openclaw-channel-gateway/
 └── package.json
 ```
 
-## License
-
-MIT
