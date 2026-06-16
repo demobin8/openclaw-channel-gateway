@@ -21,22 +21,11 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Decode OIDC token claims
+      - name: Try OIDC token exchange via npm
         run: |
-          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://registry.npmjs.org/" | jq -r .value)
-          
-          echo "=== OIDC Token Claims ==="
-          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2)
-          # Fix URL-safe base64 to standard base64 for decoding
-          PAYLOAD=$(echo "$PAYLOAD" | tr '_-' '/+')
-          # Add padding if needed
-          case $((${#PAYLOAD} % 4)) in
-            2) PAYLOAD="${PAYLOAD}==" ;;
-            3) PAYLOAD="${PAYLOAD}=" ;;
-          esac
-          echo "$PAYLOAD" | base64 -d 2>/dev/null | jq '{sub, repository, workflow_ref, ref, actor, event_name}'
-          echo "=== Expected: repository=demobin8/openclaw-channel-gateway ==="
+          echo "=== Attempting npm token create via OIDC ==="
+          npm token create --registry https://registry.npmjs.org 2>&1 || true
+          echo "=== Exit code: $? ==="
 
       - name: Install dependencies
         run: npm ci
