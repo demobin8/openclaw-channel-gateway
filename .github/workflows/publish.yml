@@ -19,19 +19,44 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
 
-      - name: Debug npm auth
+      - name: Manual OIDC exchange for npm token
         run: |
-          echo "=== npm config ==="
-          npm config list
-          echo "=== .npmrc ==="
-          cat ~/.npmrc 2>/dev/null || echo "no ~/.npmrc"
-          cat /home/runner/work/_temp/.npmrc 2>/dev/null || echo "no temp .npmrc"
-          echo "=== npm whoami ==="
-          npm whoami --registry https://registry.npmjs.org 2>&1 || true
-          echo "=== npm access ==="
-          npm access ls-collaborators openclaw-channel-gateway --registry https://registry.npmjs.org 2>&1 || true
+          echo "=== Exchanging GitHub OIDC token for npm token ==="
+          
+          # Get GitHub OIDC token
+          OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+          
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "ERROR: Failed to get OIDC token from GitHub"
+            exit 1
+          fi
+          echo "OIDC token obtained (length: ${#OIDC_TOKEN})"
+          
+          # Exchange for npm token
+          NPM_RESPONSE=$(curl -s -X POST https://registry.npmjs.org/-/npm/v1/tokens \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          
+          echo "npm response: $NPM_RESPONSE"
+          
+          NPM_TOKEN=$(echo "$NPM_RESPONSE" | jq -r .token)
+          
+          if [ "$NPM_TOKEN" = "null" ] || [ -z "$NPM_TOKEN" ]; then
+            echo "ERROR: Failed to exchange for npm token"
+            exit 1
+          fi
+          
+          echo "npm token obtained: ${NPM_TOKEN:0:8}..."
+          echo "NODE_AUTH_TOKEN=$NPM_TOKEN" >> $GITHUB_ENV
+          
+      - name: Verify npm auth
+        run: |
+          npm config set //registry.npmjs.org/:_authToken=$NODE_AUTH_TOKEN
+          npm whoami --registry https://registry.npmjs.org
+          npm access ls-collaborators openclaw-channel-gateway --registry https://registry.npmjs.org
 
       - name: Install dependencies
         run: npm ci
