@@ -80,7 +80,7 @@ function findPackageRoot(): string {
   while (dir !== path.resolve(dir, "..")) {
     try {
       const pkg = JSON.parse(readFileSync(path.resolve(dir, "package.json"), "utf-8"));
-      if (pkg.name === "ocg") return dir;
+      if (pkg.name === "openclaw-channel-gateway") return dir;
     } catch {
       // continue
     }

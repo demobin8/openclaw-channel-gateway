@@ -7,7 +7,8 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, resolve as pathResolve } from "node:path";
+import { dirname, resolve as pathResolve, join } from "node:path";
+import { homedir } from "node:os";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -16,7 +17,12 @@ export type SessionScope = Record<string, unknown>;
 
 // ── File-based store ─────────────────────────────────────────────────────
 
-const DB_FILE = process.env.OCG_SESSION_DB_PATH || "ocg-sessions.json";
+function resolveDbPath(): string {
+  if (process.env.OCG_SESSION_DB_PATH) return process.env.OCG_SESSION_DB_PATH;
+  return join(homedir(), ".openclaw-channel-gateway", "ocg-sessions.json");
+}
+
+const DB_FILE = resolveDbPath();
 
 let _store: Map<string, SessionEntry> | null = null;
 

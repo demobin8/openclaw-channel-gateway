@@ -511,8 +511,7 @@ async function cmdPluginsInstall(pkg: string): Promise<void> {
   }
   console.log(`[ocg] Installing ${pkg}...`);
   const { execSync } = await import("node:child_process");
-  const { dirname } = await import("node:path");
-  const cwd = dirname(resolveConfigPath()) || ".";
+  const cwd = process.cwd();
   try {
     execSync(`npm install ${pkg}`, { cwd, stdio: "inherit" });
     console.log(`[ocg] ${pkg} installed.`);

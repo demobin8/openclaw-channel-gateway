@@ -7,13 +7,19 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 let _runtimeConfig: Record<string, unknown> | null = null;
 let _sourceConfig: Record<string, unknown> | null = null;
 let _configTime: number | null = null;
 
-const CONFIG_FILE = process.env.OCG_CONFIG_PATH || "ocg.json";
+function resolveConfigFile(): string {
+  if (process.env.OCG_CONFIG_PATH) return process.env.OCG_CONFIG_PATH;
+  return join(homedir(), ".openclaw-channel-gateway", "ocg.json");
+}
+
+const CONFIG_FILE = resolveConfigFile();
 
 function readConfigFile() {
   if (!existsSync(CONFIG_FILE)) {

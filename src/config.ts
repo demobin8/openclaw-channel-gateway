@@ -23,6 +23,8 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export type LiteGatewayConfig = {
   /** OpenAI-compatible agent API endpoint */
@@ -47,13 +49,22 @@ export type LiteGatewayConfig = {
   channels?: Record<string, Record<string, unknown>>;
 };
 
-const DEFAULT_CONFIG_PATH = "ocg.json";
+const DEFAULT_CONFIG_DIR = join(homedir(), ".openclaw-channel-gateway");
+const DEFAULT_CONFIG_FILE = "ocg.json";
+
+/** Return the config directory (~/.openclaw-channel-gateway), created on demand. */
+export function resolveConfigDir(): string {
+  if (!existsSync(DEFAULT_CONFIG_DIR)) {
+    mkdirSync(DEFAULT_CONFIG_DIR, { recursive: true });
+  }
+  return DEFAULT_CONFIG_DIR;
+}
 
 export function resolveConfigPath(): string {
   if (process.env.OCG_CONFIG_PATH) {
     return resolve(process.env.OCG_CONFIG_PATH);
   }
-  return resolve(DEFAULT_CONFIG_PATH);
+  return join(resolveConfigDir(), DEFAULT_CONFIG_FILE);
 }
 
 export function loadConfig(): LiteGatewayConfig | null {

@@ -8,13 +8,14 @@
  * Any bundled or external OpenClaw IM plugin works out of the box.
  */
 
-import { loadConfig, resolveConfigPath, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
+import { loadConfig, resolveConfigPath, resolveConfigDir, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
 import { startAll, stopAll, listRunningChannels } from "./gateway.js";
 import { stopCallbackServer } from "./callback-server.js";
 
 export {
   loadConfig,
   resolveConfigPath,
+  resolveConfigDir,
   saveConfig,
   addChannel,
   removeChannel,
