@@ -110,20 +110,26 @@ async function httpDispatch({
   // ── Async (fire & forget) mode ──────────────────────────────────────
   const isAsync = Boolean(liteGw.async);
   if (isAsync && deliver) {
-    // Dynamically import callback-server to keep the module tree clean
-    // for sync-only users (they don't need the HTTP server dependency).
-    const { registerDeliver } = await import("../callback-server.js");
+    const { registerDeliver, buildCallbackUrl, getCallbackPort } =
+      await import("../callback-server.js");
 
     const callbackToken = registerDeliver(deliver);
-    const callbackUrl = (liteGw.callbackUrl as string) || `http://127.0.0.1:3457/ocg/callback`;
+    const callbackHost = (liteGw.callbackHost as string) ?? "127.0.0.1";
+    const callbackPort = getCallbackPort() || (liteGw.callbackPort as number) || 3457;
+    const callbackUrl = buildCallbackUrl(callbackHost, callbackPort, callbackToken);
 
-    console.log(`[ocg] Async dispatch → agent, callbackToken=${callbackToken.slice(0, 8)}...`);
+    console.log(`[ocg] Async dispatch → agent, callback=${callbackUrl}`);
 
-    // Fire & forget — do NOT await
-    const asyncHeaders: Record<string, string> = { "Content-Type": "application/json" };
+    const asyncHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-OCG-Callback": callbackUrl,
+    };
     if (apiKey) {
       asyncHeaders["Authorization"] = `Bearer ${apiKey}`;
     }
+
+    // Fire & forget — do NOT await
+    // Request body is pure OpenAI format, no custom fields
     fetch(agentUrl, {
       method: "POST",
       headers: asyncHeaders,
@@ -131,8 +137,6 @@ async function httpDispatch({
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: false,
-        callback_url: callbackUrl,
-        callback_token: callbackToken,
       }),
       signal: AbortSignal.timeout(300_000),
     }).catch((err: Error) => {

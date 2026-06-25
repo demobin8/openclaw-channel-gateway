@@ -45,6 +45,8 @@ export type LiteGatewayConfig = {
   callbackPort?: number;
   /** Host for the callback HTTP server (default "127.0.0.1") */
   callbackHost?: string;
+  /** Shared secret for HMAC callback signature verification (optional) */
+  callbackSecret?: string;
   /** OpenClaw-compatible channel configs */
   channels?: Record<string, Record<string, unknown>>;
 };
@@ -99,6 +101,7 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
       verbose: raw.verbose,
       async: raw.async ?? false,
       callbackUrl: `http://${raw.callbackHost ?? "127.0.0.1"}:${raw.callbackPort ?? 3457}/ocg/callback`,
+      callbackSecret: raw.callbackSecret,
     },
   };
 }

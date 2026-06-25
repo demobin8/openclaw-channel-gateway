@@ -310,7 +310,7 @@ async function cmdChannelsStart(args: Args): Promise<void> {
     const cbHost = rawCfg.callbackHost ?? "127.0.0.1";
     const cbPort = rawCfg.callbackPort ?? 3457;
     try {
-      await startCallbackServer(cbHost, cbPort);
+      await startCallbackServer(cbHost, cbPort, rawCfg.callbackSecret);
     } catch (err) {
       console.error(`[ocg] Failed to start callback server: ${(err as Error).message}`);
     }

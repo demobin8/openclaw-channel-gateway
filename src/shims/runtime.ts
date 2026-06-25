@@ -24,6 +24,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
+import type { DeliverFn } from "../callback-server.js";
 
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
 
@@ -75,11 +76,6 @@ type RuntimeLogger = {
   error: (msg: string) => void;
   child?: (bindings: Record<string, unknown>) => RuntimeLogger;
 };
-
-type DeliverFn = (
-  payload: Record<string, unknown>,
-  meta: { kind: string; assistantMessageIndex?: number },
-) => Promise<void>;
 
 type DispatcherOptions = {
   deliver: DeliverFn;
@@ -376,6 +372,53 @@ async function dispatchReplyFromConfig(params: {
     console.log(`       Body: ${preview}`);
   }
   console.log(`       → ${modelStr} @ ${agentUrl}`);
+
+  // ── Async (fire & forget) mode ──────────────────────────────────────
+  const isAsync = Boolean(liteGw.async);
+  if (isAsync) {
+    const { registerDeliver, buildCallbackUrl, getCallbackPort } =
+      await import("../callback-server.js");
+
+    // Wrap dispatcher methods into a single deliver function
+    const deliver: DeliverFn = async (payload, meta) => {
+      if (meta.kind === "block") {
+        dispatcher.sendBlockReply(payload);
+      } else {
+        dispatcher.sendFinalReply(payload);
+      }
+    };
+
+    const callbackToken = registerDeliver(deliver);
+    const callbackHost = (liteGw.callbackHost as string) ?? "127.0.0.1";
+    const callbackPort = getCallbackPort() || (liteGw.callbackPort as number) || 3457;
+    const callbackUrl = buildCallbackUrl(callbackHost, callbackPort, callbackToken);
+
+    console.log(`[ocg] Async dispatch → agent, callback=${callbackUrl}`);
+
+    const asyncHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-OCG-Callback": callbackUrl,
+    };
+    if (apiKey) {
+      asyncHeaders["Authorization"] = `Bearer ${apiKey}`;
+    }
+
+    // Fire & forget — do NOT await
+    fetch(agentUrl, {
+      method: "POST",
+      headers: asyncHeaders,
+      body: JSON.stringify({
+        model: modelStr,
+        messages: [{ role: "user", content: body }],
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(300_000),
+    }).catch((err: Error) => {
+      console.error(`[ocg] Async forward error: ${err.message}`);
+    });
+
+    return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
+  }
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) {

@@ -1,20 +1,21 @@
 /**
  * Callback HTTP server for async dispatch mode.
  *
- * Agent backends POST to /ocg/callback with the reply, and this server
- * looks up the stored {@link DeliverFn} and delivers the message to the
- * channel plugin.
+ * Agent backends POST to /ocg/callback/{token} with the reply body.
+ * The token is a URL path segment (standard REST webhook pattern),
+ * NOT embedded in the JSON body.
+ *
+ * Optional HMAC-SHA256 signature verification via X-OCG-Signature header.
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-/** The payload the agent backend sends to /ocg/callback */
+/** The payload the agent backend sends to /ocg/callback/{token} */
 export interface CallbackPayload {
-  /** Opaque token returned in the forward request so we can find the deliver fn */
-  callbackToken: string;
-  /** Reply text (or structured content object) */
+  /** Reply text (string) or structured content object */
   reply?: string | Record<string, unknown>;
   /** If true, treat this as an error reply */
   isError?: boolean;
@@ -38,14 +39,14 @@ const deliverRegistry = new Map<string, DeliverFn>();
 const DELIVER_TTL_MS = 10 * 60_000;
 
 /**
- * Register a deliver function and return a token that the agent backend
- * can use to call back.
+ * Register a deliver function and return a token.
+ * The caller uses this token to build the callback URL:
+ *   POST /ocg/callback/{token}
  */
 export function registerDeliver(deliver: DeliverFn): string {
   const token = randomToken();
   deliverRegistry.set(token, deliver);
 
-  // Auto-cleanup
   setTimeout(() => {
     deliverRegistry.delete(token);
   }, DELIVER_TTL_MS);
@@ -53,8 +54,8 @@ export function registerDeliver(deliver: DeliverFn): string {
   return token;
 }
 
-/** Look up and remove a deliver function */
-function consumeDeliver(token: string): DeliverFn | undefined {
+/** Look up and remove a deliver function. Returns undefined if expired. */
+export function consumeDeliver(token: string): DeliverFn | undefined {
   const fn = deliverRegistry.get(token);
   deliverRegistry.delete(token);
   return fn;
@@ -63,11 +64,7 @@ function consumeDeliver(token: string): DeliverFn | undefined {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 function randomToken(): string {
-  const buf = Buffer.allocUnsafe(16);
-  for (let i = 0; i < buf.length; i++) {
-    buf[i] = (Math.random() * 256) | 0;
-  }
-  return buf.toString("hex");
+  return randomBytes(32).toString("hex");
 }
 
 function jsonBody<T = unknown>(res: ServerResponse, code: number, body: T): void {
@@ -75,37 +72,92 @@ function jsonBody<T = unknown>(res: ServerResponse, code: number, body: T): void
   res.end(JSON.stringify(body));
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+// ── HMAC verification ──────────────────────────────────────────────────
+
+function verifyHmac(
+  rawBody: Buffer,
+  signatureHeader: string | undefined,
+  secret: string,
+): boolean {
+  if (!signatureHeader) return false;
+  // Expected format: sha256=<hex-digest>
+  const match = signatureHeader.match(/^sha256=([0-9a-fA-F]{64})$/);
+  if (!match) return false;
+
+  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const received = Buffer.from(match[1], "hex");
+  const expectedBuf = Buffer.from(expected, "hex");
+
+  if (received.length !== expectedBuf.length) return false;
+  return timingSafeEqual(received, expectedBuf);
 }
 
 // ── Server ─────────────────────────────────────────────────────────────
 
 let server: Server | null = null;
+let _boundPort = 0;
+let _callbackSecret: string | null = null;
+
+/**
+ * Build the full callback URL with embedded token.
+ * Used by dispatch shims to construct the X-OCG-Callback header.
+ */
+export function buildCallbackUrl(
+  host: string,
+  port: number,
+  token: string,
+): string {
+  return `http://${host}:${port}/ocg/callback/${token}`;
+}
+
+/**
+ * Retrieve the HMAC secret used for callback verification (if configured).
+ */
+export function getCallbackSecret(): string | null {
+  return _callbackSecret;
+}
+
+/**
+ * Retrieve the actual bound port (may differ from requested port=0).
+ */
+export function getCallbackPort(): number {
+  return _boundPort;
+}
 
 /**
  * Start the callback HTTP server.
- * Returns the bound port (may differ from `port` if port was 0).
+ *
+ * @param host - bind address (default "127.0.0.1")
+ * @param port - bind port (default 3457)
+ * @param secret - optional HMAC shared secret for signature verification
+ * @returns the bound port number
  */
 export async function startCallbackServer(
   host: string,
   port: number,
+  secret?: string,
 ): Promise<number> {
   if (server) {
     console.warn("[ocg] callback server already running");
-    return (server.address() as { port: number }).port;
+    return _boundPort;
   }
+
+  _callbackSecret = secret ?? null;
 
   server = createServer(async (req, res) => {
     // CORS for agent backends on other ports
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-OCG-Signature");
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -113,23 +165,43 @@ export async function startCallbackServer(
       return;
     }
 
-    if (req.method !== "POST" || req.url !== "/ocg/callback") {
+    // Route: POST /ocg/callback/{token}
+    const url = req.url ?? "/";
+    const match = url.match(/^\/ocg\/callback\/([a-f0-9]{64})(?:\?.*)?$/);
+
+    if (req.method !== "POST" || !match) {
+      if (req.method === "POST" && url === "/ocg/callback") {
+        // Backward-compat hint for old agent runtimes
+        jsonBody(res, 400, {
+          error: "callback token must be in URL path: POST /ocg/callback/{token}",
+        });
+        return;
+      }
       jsonBody(res, 404, { error: "not found" });
       return;
     }
 
-    try {
-      const raw = await readBody(req);
-      const payload: CallbackPayload = JSON.parse(raw);
+    const token = match[1];
 
-      if (!payload.callbackToken) {
-        jsonBody(res, 400, { error: "missing callbackToken" });
-        return;
+    try {
+      const rawBody = await readBody(req);
+
+      // HMAC verification (if secret is configured)
+      if (_callbackSecret) {
+        const sigHeader = req.headers["x-ocg-signature"] as string | undefined;
+        if (!verifyHmac(rawBody, sigHeader, _callbackSecret)) {
+          console.warn("[ocg] callback HMAC verification failed");
+          jsonBody(res, 401, { error: "signature verification failed" });
+          return;
+        }
       }
 
-      const deliver = consumeDeliver(payload.callbackToken);
+      const bodyStr = rawBody.toString("utf-8");
+      const payload: CallbackPayload = JSON.parse(bodyStr);
+
+      const deliver = consumeDeliver(token);
       if (!deliver) {
-        jsonBody(res, 404, { error: "unknown or expired callbackToken" });
+        jsonBody(res, 404, { error: "unknown or expired callback token" });
         return;
       }
 
@@ -167,9 +239,10 @@ export async function startCallbackServer(
     });
     server!.listen(port, host, () => {
       const addr = server!.address();
-      const boundPort = typeof addr === "string" ? port : addr?.port ?? port;
-      console.log(`[ocg] Callback server listening on http://${host}:${boundPort}`);
-      resolve(boundPort);
+      _boundPort = typeof addr === "string" ? port : addr?.port ?? port;
+      const hmacInfo = _callbackSecret ? " (HMAC enabled)" : "";
+      console.log(`[ocg] Callback server listening on http://${host}:${_boundPort}${hmacInfo}`);
+      resolve(_boundPort);
     });
   });
 }
@@ -180,6 +253,7 @@ export async function stopCallbackServer(): Promise<void> {
   return new Promise((resolve) => {
     server!.close(() => {
       server = null;
+      _boundPort = 0;
       resolve();
     });
   });

@@ -184,19 +184,37 @@ Set `"async": true` in `ocg.json`:
 {
   "async": true,
   "callbackPort": 3457,
-  "callbackHost": "127.0.0.1"
+  "callbackHost": "127.0.0.1",
+  "callbackSecret": "(optional) shared secret"
 }
 ```
 
-In this mode, OCG forwards the message to the Agent and returns immediately. The Agent calls back `POST /ocg/callback` when the reply is ready. Callback payload format:
+In this mode, OCG forwards the message and returns immediately. The Agent runtime calls back when the reply is ready.
 
-```json
-{
-  "callbackToken": "<token>",
-  "reply": "Reply content",
-  "isError": false
-}
+**Forward request** (clean OpenAI format, no custom body fields):
+
+```http
+POST /v1/chat/completions
+Content-Type: application/json
+X-OCG-Callback: http://127.0.0.1:3457/ocg/callback/{token}
+
+{ "model": "gpt-4o", "messages": [...], "stream": false }
 ```
+
+**Agent callback** (POST to the URL from `X-OCG-Callback` header):
+
+```http
+POST /ocg/callback/{token}
+Content-Type: application/json
+X-OCG-Signature: sha256=...  (required when callbackSecret is set)
+
+{ "reply": "Reply content", "isError": false }
+```
+
+| Callback field | Type | Description |
+|---|---|---|
+| `reply` | string \| object | Reply text (string) or structured content (`{ text, content, ... }`) |
+| `isError` | boolean | If `true`, OCG delivers the reply as an error message |
 
 ## How It Stays Compatible with OpenClaw
 
