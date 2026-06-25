@@ -43,7 +43,7 @@ export type LiteGatewayConfig = {
   async?: boolean;
   /** Port for the callback HTTP server (default 3457) */
   callbackPort?: number;
-  /** Host for the callback HTTP server (default "127.0.0.1") */
+  /** Host for the callback HTTP server (default "0.0.0.0" — all interfaces). In X-OCG-Callback header, 0.0.0.0 is rewritten to 127.0.0.1. */
   callbackHost?: string;
   /** Shared secret for HMAC callback signature verification (optional) */
   callbackSecret?: string;

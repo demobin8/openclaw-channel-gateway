@@ -78,7 +78,7 @@ export async function startAll(
 
   // Start callback server for async dispatch (only if not already running)
   if (!isCallbackServerRunning()) {
-    const cbHost = rawCfg.callbackHost ?? "127.0.0.1";
+    const cbHost = rawCfg.callbackHost ?? "0.0.0.0";
     const cbPort = rawCfg.callbackPort ?? 3457;
     try {
       await startCallbackServer(cbHost, cbPort, rawCfg.callbackSecret);

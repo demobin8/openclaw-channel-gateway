@@ -198,8 +198,9 @@ OCG forwards the message (clean OpenAI format) and returns immediately. No HTTP 
 {
   "async": true,
   "callbackPort": 3457,
-  "callbackHost": "127.0.0.1",
-  "callbackSecret": "(optional)"
+  "callbackHost": "0.0.0.0",
+  "callbackSecret": "(optional)",
+  "callbackTokenTTL": 1800
 }
 ```
 
@@ -207,7 +208,7 @@ OCG forwards the message (clean OpenAI format) and returns immediately. No HTTP 
 |---|---|---|
 | `async` | `false` | Enable async dispatch mode |
 | `callbackPort` | `3457` | Port for the built-in callback HTTP server |
-| `callbackHost` | `127.0.0.1` | Bind address for the callback server |
+| `callbackHost` | `0.0.0.0` | Bind address (all interfaces). The `X-OCG-Callback` URL auto-rewrites `0.0.0.0` → `127.0.0.1` |
 | `callbackSecret` | — | Shared secret for HMAC-SHA256 signature verification |
 | `callbackTokenTTL` | `1800` | Callback token lifetime in seconds (default 30 minutes) |
 

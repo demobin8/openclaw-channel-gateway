@@ -115,7 +115,7 @@ async function httpDispatch({
 
     const ttlMs = ((liteGw.callbackTokenTTL as number) ?? 1800) * 1000;
     const callbackToken = registerDeliver(deliver, ttlMs);
-    const callbackHost = (liteGw.callbackHost as string) ?? "127.0.0.1";
+    const callbackHost = (liteGw.callbackHost as string) ?? "0.0.0.0";
     const callbackPort = getCallbackPort() || (liteGw.callbackPort as number) || 3457;
     const callbackUrl = buildCallbackUrl(callbackHost, callbackPort, callbackToken);
 

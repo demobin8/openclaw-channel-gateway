@@ -3,6 +3,10 @@
   "model": "gpt-4o",
   "apiKey": "",
   "verbose": false,
+
+  "_async": "Uncomment below for async fire-and-forget mode:",
+  "_comment": "  async: true, callbackPort: 3457, callbackHost: 0.0.0.0, callbackTokenTTL: 1800",
+
   "channels": {
     "telegram": {
       "accounts": {

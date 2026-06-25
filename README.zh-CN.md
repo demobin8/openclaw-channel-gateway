@@ -198,8 +198,9 @@ OCG 以**纯 OpenAI 格式**转发消息后立即返回，不保持 HTTP 长连�
 {
   "async": true,
   "callbackPort": 3457,
-  "callbackHost": "127.0.0.1",
-  "callbackSecret": "（可选）"
+  "callbackHost": "0.0.0.0",
+  "callbackSecret": "（可选）",
+  "callbackTokenTTL": 1800
 }
 ```
 
@@ -207,7 +208,7 @@ OCG 以**纯 OpenAI 格式**转发消息后立即返回，不保持 HTTP 长连�
 |---|---|---|
 | `async` | `false` | 启用异步调度 |
 | `callbackPort` | `3457` | OCG 内置回调 HTTP 服务端口 |
-| `callbackHost` | `127.0.0.1` | 回调服务绑定地址 |
+| `callbackHost` | `0.0.0.0` | 绑定地址（所有网络接口）。`X-OCG-Callback` URL 中 `0.0.0.0` 自动改写为 `127.0.0.1` |
 | `callbackSecret` | — | HMAC-SHA256 签名共享密钥（可选） |
 | `callbackTokenTTL` | `1800` | Token 有效期（秒，默认 30 分钟） |
 

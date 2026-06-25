@@ -114,14 +114,18 @@ let _callbackSecret: string | null = null;
 
 /**
  * Build the full callback URL with embedded token.
+ *
  * Used by dispatch shims to construct the X-OCG-Callback header.
+ * If `host` is "0.0.0.0", the URL uses "127.0.0.1" so the Agent
+ * can actually reach it.
  */
 export function buildCallbackUrl(
   host: string,
   port: number,
   token: string,
 ): string {
-  return `http://${host}:${port}/ocg/callback/${token}`;
+  const reachableHost = host === "0.0.0.0" ? "127.0.0.1" : host;
+  return `http://${reachableHost}:${port}/ocg/callback/${token}`;
 }
 
 /**
