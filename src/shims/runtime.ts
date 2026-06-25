@@ -388,7 +388,8 @@ async function dispatchReplyFromConfig(params: {
       }
     };
 
-    const callbackToken = registerDeliver(deliver);
+    const ttlMs = ((liteGw.callbackTokenTTL as number) ?? 1800) * 1000;
+    const callbackToken = registerDeliver(deliver, ttlMs);
     const callbackHost = (liteGw.callbackHost as string) ?? "127.0.0.1";
     const callbackPort = getCallbackPort() || (liteGw.callbackPort as number) || 3457;
     const callbackUrl = buildCallbackUrl(callbackHost, callbackPort, callbackToken);

@@ -47,6 +47,8 @@ export type LiteGatewayConfig = {
   callbackHost?: string;
   /** Shared secret for HMAC callback signature verification (optional) */
   callbackSecret?: string;
+  /** Callback token TTL in seconds (default 1800 = 30 minutes) */
+  callbackTokenTTL?: number;
   /** OpenClaw-compatible channel configs */
   channels?: Record<string, Record<string, unknown>>;
 };
@@ -102,6 +104,7 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
       async: raw.async ?? false,
       callbackUrl: `http://${raw.callbackHost ?? "127.0.0.1"}:${raw.callbackPort ?? 3457}/ocg/callback`,
       callbackSecret: raw.callbackSecret,
+      callbackTokenTTL: raw.callbackTokenTTL,
     },
   };
 }

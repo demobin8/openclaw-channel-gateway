@@ -209,6 +209,7 @@ OCG forwards the message (clean OpenAI format) and returns immediately. No HTTP 
 | `callbackPort` | `3457` | Port for the built-in callback HTTP server |
 | `callbackHost` | `127.0.0.1` | Bind address for the callback server |
 | `callbackSecret` | — | Shared secret for HMAC-SHA256 signature verification |
+| `callbackTokenTTL` | `1800` | Callback token lifetime in seconds (default 30 minutes) |
 
 **Protocol — Forward request** (OCG → Agent):
 
@@ -265,7 +266,7 @@ OCG rejects callbacks with missing or incorrect signatures (HTTP 401).
 **Token lifecycle:**
 
 - Each forwarded message gets a unique 64-hex-char token (backed by `crypto.randomBytes`).
-- The token is valid for **10 minutes**. If the Agent takes longer, it must re-send (the original message will still be delivered to the Agent, and the callback will get a new token).
+- The token is valid for **30 minutes** by default (configurable via `callbackTokenTTL` in seconds). If the Agent takes longer, it must re-send (the original message will still be delivered to the Agent, and the callback will get a new token).
 - Each token is **single-use** — consumed on first successful callback.
 
 **Example Agent Runtime (Node.js)**:

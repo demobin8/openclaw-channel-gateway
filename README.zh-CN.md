@@ -209,6 +209,7 @@ OCG 以**纯 OpenAI 格式**转发消息后立即返回，不保持 HTTP 长连�
 | `callbackPort` | `3457` | OCG 内置回调 HTTP 服务端口 |
 | `callbackHost` | `127.0.0.1` | 回调服务绑定地址 |
 | `callbackSecret` | — | HMAC-SHA256 签名共享密钥（可选） |
+| `callbackTokenTTL` | `1800` | Token 有效期（秒，默认 30 分钟） |
 
 **协议 — 转发请求**（OCG → Agent）：
 
@@ -265,7 +266,7 @@ OCG 会拒绝签名缺失或错误的回调（HTTP 401）。
 **Token 生命周期：**
 
 - 每条转发消息生成一个唯一 64 位十六进制 token（基于 `crypto.randomBytes`）。
-- Token 有效期为 **10 分钟**。超时后需重新发起请求，新的转发会产生新 token。
+- Token 默认有效期为 **30 分钟**（可通过 `callbackTokenTTL` 秒数配置）。超时后需重新发起请求，新的转发会产生新 token。
 - 每个 token **一次性消费**——成功回调后立即销毁，防止重放。
 
 **Agent Runtime 示例（Node.js）：**

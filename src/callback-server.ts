@@ -35,21 +35,26 @@ export type DeliverFn = (
 /** Maps callbackToken → deliver function */
 const deliverRegistry = new Map<string, DeliverFn>();
 
-/** Auto-cleanup after 10 minutes */
-const DELIVER_TTL_MS = 10 * 60_000;
+/** Auto-cleanup TTL in milliseconds (default 30 minutes) */
+const DEFAULT_DELIVER_TTL_MS = 30 * 60_000;
 
 /**
  * Register a deliver function and return a token.
  * The caller uses this token to build the callback URL:
  *   POST /ocg/callback/{token}
+ *
+ * @param deliver - the delivery function
+ * @param ttlMs - token lifetime in milliseconds (default 30 minutes)
  */
-export function registerDeliver(deliver: DeliverFn): string {
+export function registerDeliver(deliver: DeliverFn, ttlMs?: number): string {
   const token = randomToken();
   deliverRegistry.set(token, deliver);
 
+  const ttl = ttlMs && ttlMs > 0 ? ttlMs : DEFAULT_DELIVER_TTL_MS;
+
   setTimeout(() => {
     deliverRegistry.delete(token);
-  }, DELIVER_TTL_MS);
+  }, ttl);
 
   return token;
 }
