@@ -51,6 +51,7 @@ coverage/
 .stylelintcache
 dist/
 **/bin/
+!/bin/
 .claude
 .core-ai
 
