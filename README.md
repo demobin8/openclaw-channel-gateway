@@ -178,43 +178,128 @@ Receive message → HTTP POST to Agent API → stream SSE response → deliver b
 
 ### Async Mode (Fire & Forget)
 
-Set `"async": true` in `ocg.json`:
+When the Agent Runtime needs to run long tasks (e.g., crawling, complex reasoning, multi-step tool calls), the synchronous HTTP connection may time out. Async mode solves this by decoupling request forwarding and reply delivery.
+
+**How it works:**
+
+```
+IM → OCG ──POST (fast)──→ Agent Runtime
+                              │
+                              ├─ 1. Parse incoming message
+                              ├─ 2. Run long task (minutes~hours)
+                              └─ 3. POST /ocg/callback/{token} → OCG → IM
+```
+
+OCG forwards the message (clean OpenAI format) and returns immediately. No HTTP connection is held open. When the Agent finishes, it calls the callback URL to deliver the reply.
+
+**Configuration** (`ocg.json`):
 
 ```json
 {
   "async": true,
   "callbackPort": 3457,
   "callbackHost": "127.0.0.1",
-  "callbackSecret": "(optional) shared secret"
+  "callbackSecret": "(optional)"
 }
 ```
 
-In this mode, OCG forwards the message and returns immediately. The Agent runtime calls back when the reply is ready.
+| Config key | Default | Description |
+|---|---|---|
+| `async` | `false` | Enable async dispatch mode |
+| `callbackPort` | `3457` | Port for the built-in callback HTTP server |
+| `callbackHost` | `127.0.0.1` | Bind address for the callback server |
+| `callbackSecret` | — | Shared secret for HMAC-SHA256 signature verification |
 
-**Forward request** (clean OpenAI format, no custom body fields):
+**Protocol — Forward request** (OCG → Agent):
+
+OCG sends a **standard OpenAI chat completion request** with the callback URL in an HTTP header. The request body contains no custom fields — any OpenAI-compatible API can receive it unchanged.
 
 ```http
 POST /v1/chat/completions
 Content-Type: application/json
-X-OCG-Callback: http://127.0.0.1:3457/ocg/callback/{token}
+X-OCG-Callback: http://127.0.0.1:3457/ocg/callback/a1b2c3d4...
+Authorization: Bearer sk-xxx
 
-{ "model": "gpt-4o", "messages": [...], "stream": false }
+{
+  "model": "gpt-4o",
+  "messages": [{ "role": "user", "content": "Hello" }],
+  "stream": false
+}
 ```
 
-**Agent callback** (POST to the URL from `X-OCG-Callback` header):
+| Header | Description |
+|---|---|
+| `X-OCG-Callback` | Callback URL the Agent must POST to when done. Includes a 64-hex-char random token in the path. |
+
+**Protocol — Callback request** (Agent → OCG):
+
+When the Agent finishes processing, it sends the reply to the callback URL from the `X-OCG-Callback` header.
 
 ```http
-POST /ocg/callback/{token}
+POST /ocg/callback/a1b2c3d4...
 Content-Type: application/json
-X-OCG-Signature: sha256=...  (required when callbackSecret is set)
+X-OCG-Signature: sha256=<hex-digest>
 
-{ "reply": "Reply content", "isError": false }
+{
+  "reply": "Reply content",
+  "isError": false
+}
 ```
 
-| Callback field | Type | Description |
-|---|---|---|
-| `reply` | string \| object | Reply text (string) or structured content (`{ text, content, ... }`) |
-| `isError` | boolean | If `true`, OCG delivers the reply as an error message |
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `reply` | string \| object | Yes | Reply text (`string`) or structured content (`{ text, content, ... }`) |
+| `isError` | boolean | No | If `true`, OCG delivers as an error message (default `false`) |
+
+**HMAC Signature** (optional):
+
+When `callbackSecret` is configured, the Agent must sign each callback request:
+
+```
+signature = HMAC-SHA256(request-body-bytes, callbackSecret)
+header    = "sha256=" + hex(signature)
+```
+
+OCG rejects callbacks with missing or incorrect signatures (HTTP 401).
+
+**Token lifecycle:**
+
+- Each forwarded message gets a unique 64-hex-char token (backed by `crypto.randomBytes`).
+- The token is valid for **10 minutes**. If the Agent takes longer, it must re-send (the original message will still be delivered to the Agent, and the callback will get a new token).
+- Each token is **single-use** — consumed on first successful callback.
+
+**Example Agent Runtime (Node.js)**:
+
+```js
+import http from "node:http";
+
+const server = http.createServer(async (req, res) => {
+  // 1. Read the forward request
+  const body = await readBody(req);
+  const callbackUrl = req.headers["x-ocg-callback"];
+  if (!callbackUrl) {
+    res.writeHead(400); res.end("missing X-OCG-Callback"); return;
+  }
+
+  // 2. Respond immediately — OCG doesn't wait
+  res.writeHead(202, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "accepted" }));
+
+  // 3. Do the actual work
+  const msg = JSON.parse(body).messages[0].content;
+  const reply = await yourAgent.process(msg); // may take minutes
+
+  // 4. Call back OCG with the result
+  await fetch(callbackUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reply }),
+  });
+});
+server.listen(8080);
+```
+
+> **Tip**: The above example shows a minimal Agent Runtime. For HMAC signing, compute `HMAC-SHA256(responseBody, secret)` and add the `X-OCG-Signature` header.
 
 ## How It Stays Compatible with OpenClaw
 
