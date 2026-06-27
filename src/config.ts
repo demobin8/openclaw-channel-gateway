@@ -45,6 +45,10 @@ export type LiteGatewayConfig = {
   callbackPort?: number;
   /** Host for the callback HTTP server (default "0.0.0.0" — all interfaces). In X-OCG-Callback header, 0.0.0.0 is rewritten to 127.0.0.1. */
   callbackHost?: string;
+  /** Public host advertised in X-OCG-Callback when callback traffic is proxied */
+  callbackPublicHost?: string;
+  /** Public port advertised in X-OCG-Callback when callback traffic is proxied */
+  callbackPublicPort?: number;
   /** Shared secret for HMAC callback signature verification (optional) */
   callbackSecret?: string;
   /** Callback token TTL in seconds (default 1800 = 30 minutes) */
@@ -102,9 +106,9 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
       apiKey: raw.apiKey,
       verbose: raw.verbose,
       async: raw.async ?? false,
-      callbackHost: raw.callbackHost,
-      callbackPort: raw.callbackPort,
-      callbackUrl: `http://${raw.callbackHost ?? "127.0.0.1"}:${raw.callbackPort ?? 3457}/ocg/callback`,
+      callbackHost: raw.callbackPublicHost ?? raw.callbackHost,
+      callbackPort: raw.callbackPublicPort ?? raw.callbackPort,
+      callbackUrl: `http://${raw.callbackPublicHost ?? raw.callbackHost ?? "127.0.0.1"}:${raw.callbackPublicPort ?? raw.callbackPort ?? 3457}/ocg/callback`,
       callbackSecret: raw.callbackSecret,
       callbackTokenTTL: raw.callbackTokenTTL,
     },
