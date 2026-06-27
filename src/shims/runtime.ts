@@ -405,6 +405,7 @@ async function dispatchReplyFromConfig(params: {
     }
 
     // Fire & forget — do NOT await
+    // Request body stays OpenAI-compatible; user carries the stable IM session key.
     fetch(agentUrl, {
       method: "POST",
       headers: asyncHeaders,
@@ -412,6 +413,7 @@ async function dispatchReplyFromConfig(params: {
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: false,
+        user: sessionKey,
       }),
       signal: AbortSignal.timeout(300_000),
     }).catch((err: Error) => {
