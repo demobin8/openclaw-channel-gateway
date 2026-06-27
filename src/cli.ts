@@ -29,6 +29,7 @@ import {
   listConfiguredChannels,
   listAllChannels,
   resolveConfigPath,
+  saveConfig,
 } from "./index.js";
 import { applyConfigEnvOverrides } from "./config.js";
 import { startCallbackServer, isCallbackServerRunning } from "./callback-server.js";
@@ -86,6 +87,9 @@ function printHelp(): void {
   console.log("");
   console.log("  plugins install <pkg>            Install a channel plugin (npm install)");
   console.log("  plugins list                     List installed channel plugins");
+  console.log("");
+  console.log("  config set <path> <value>        Set config value (OpenClaw-compatible paths)");
+  console.log("  config get [path]                Print config or config value");
   console.log("");
   console.log("Environment:");
   console.log("  OCG_CONFIG_PATH     Config file path");
@@ -543,6 +547,105 @@ async function cmdPluginsInstall(pkg: string): Promise<void> {
   }
 }
 
+function parseConfigValue(value: string): unknown {
+  const trimmed = value.trim();
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed === "null") return null;
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]")) ||
+    (trimmed.startsWith('"') && trimmed.endsWith('"'))
+  ) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      // Fall through to string for non-JSON shell input.
+    }
+  }
+  return value;
+}
+
+function splitConfigPath(path: string): string[] {
+  return path.split(".").filter(Boolean);
+}
+
+function getConfigPathValue(root: Record<string, unknown>, path: string): unknown {
+  const parts = splitConfigPath(path);
+  let cursor: unknown = root;
+  for (const part of parts) {
+    if (!cursor || typeof cursor !== "object") return undefined;
+    cursor = (cursor as Record<string, unknown>)[part];
+  }
+  return cursor;
+}
+
+function setConfigPathValue(root: Record<string, unknown>, path: string, value: unknown): void {
+  const parts = splitConfigPath(path);
+  if (parts.length === 0) throw new Error("Config path cannot be empty");
+
+  let cursor: Record<string, unknown> = root;
+  for (const part of parts.slice(0, -1)) {
+    const next = cursor[part];
+    if (!next || typeof next !== "object" || Array.isArray(next)) {
+      cursor[part] = {};
+    }
+    cursor = cursor[part] as Record<string, unknown>;
+  }
+  cursor[parts[parts.length - 1]] = value;
+}
+
+function syncPluginEnablePathToChannel(
+  cfg: Record<string, unknown>,
+  path: string,
+  value: unknown,
+): string | null {
+  const match = /^plugins\.entries\.([^.]+)\.enabled$/.exec(path);
+  if (!match) return null;
+
+  const channelId = match[1];
+  const channels = (cfg.channels ??= {}) as Record<string, unknown>;
+  const existing = channels[channelId];
+  const channel =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? (existing as Record<string, unknown>)
+      : {};
+
+  channel.enabled = value;
+  channels[channelId] = channel;
+  return channelId;
+}
+
+function cmdConfigSet(path: string, rawValue: string | undefined): void {
+  if (!path || rawValue === undefined) {
+    console.error("Usage: ocg config set <path> <value>");
+    console.error("Example: ocg config set plugins.entries.openclaw-weixin.enabled true");
+    process.exit(1);
+  }
+
+  const cfg = (loadConfig() ?? {}) as Record<string, unknown>;
+  const value = parseConfigValue(rawValue);
+  setConfigPathValue(cfg, path, value);
+  const syncedChannel = syncPluginEnablePathToChannel(cfg, path, value);
+  saveConfig(cfg);
+
+  console.log(`[ocg] Set ${path} = ${JSON.stringify(value)}`);
+  if (syncedChannel) {
+    console.log(`[ocg] Synced channel "${syncedChannel}" enabled = ${JSON.stringify(value)}`);
+  }
+}
+
+function cmdConfigGet(path?: string): void {
+  const cfg = (loadConfig() ?? {}) as Record<string, unknown>;
+  const value = path ? getConfigPathValue(cfg, path) : cfg;
+  if (value === undefined) {
+    process.exitCode = 1;
+    return;
+  }
+  console.log(JSON.stringify(value, null, 2));
+}
+
 async function cmdPluginsList(): Promise<void> {
   // Show discovered plugins (both bundled and external)
   const bundled = discoverBundledPlugins();
@@ -615,6 +718,22 @@ async function run(): Promise<void> {
     process.exit(1);
   }
 
+  // config subcommands
+  if (command.startsWith("config ")) {
+    const rest = command.slice("config ".length);
+    if (rest.startsWith("set ")) {
+      const tokens = rest.slice("set ".length).trim().split(/\s+/);
+      const path = tokens.shift() ?? "";
+      return cmdConfigSet(path, tokens.join(" "));
+    }
+    if (rest === "get") return cmdConfigGet();
+    if (rest.startsWith("get ")) return cmdConfigGet(rest.slice("get ".length).trim());
+    console.log("Usage: ocg config <set|get>");
+    console.log("  ocg config set plugins.entries.openclaw-weixin.enabled true");
+    console.log("  ocg config get plugins.entries.openclaw-weixin.enabled");
+    process.exit(1);
+  }
+
   // channels subcommands
   if (command.startsWith("channels ")) {
     const sub = command.slice("channels ".length);
@@ -637,6 +756,13 @@ async function run(): Promise<void> {
   }
 
   // Unknown
+  if (command === "config") {
+    console.log("Usage: ocg config <set|get>");
+    console.log("  ocg config set plugins.entries.openclaw-weixin.enabled true");
+    console.log("  ocg config get plugins.entries.openclaw-weixin.enabled");
+    process.exit(1);
+  }
+
   console.error(`Unknown command: ${command}`);
   console.error("Use ocg --help");
   process.exit(1);
