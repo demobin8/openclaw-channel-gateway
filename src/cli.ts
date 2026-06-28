@@ -48,15 +48,27 @@ import {
   channelLoginStart,
   channelLoginWait,
 } from "./plugin-loader.js";
+import { readFileSync } from "node:fs";
 
-const VERSION = "1.0.1";
+function readPackageVersion(): string {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+const VERSION = readPackageVersion();
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function printBanner(): void {
   console.log(
     "╔══════════════════════════════════════╗\n" +
-    "║         OCG  v1.0.0                    ║\n" +
+    `║         OCG  v${VERSION.padEnd(24)}║\n` +
     "║   OpenClaw Channel Gateway            ║\n" +
     "║   IM bridge → External Agent API      ║\n" +
     "╚══════════════════════════════════════╝",
