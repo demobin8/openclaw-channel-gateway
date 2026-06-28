@@ -23,6 +23,8 @@ export type {
   ReplyPayload,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 
+import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
+
 // ── HTTP dispatch implementation ────────────────────────────────────────
 
 async function httpDispatch({
@@ -82,6 +84,7 @@ async function httpDispatch({
   const verbose =
     (liteGw.verbose as boolean) ||
     process.env.OCG_VERBOSE === "1";
+  const replyChunkSize = resolveReplyChunkSize(liteGw.replyChunkSize);
 
   // ── Verbose: log incoming message ────────────────────────────────────
   console.log(`\n${"=".repeat(60)}`);
@@ -215,11 +218,10 @@ async function httpDispatch({
             }
 
             if (deliver) {
-              await deliver(finalPayload, {
+              deliveredCounts.block += await deliverPayloadInChunks(deliver, finalPayload, {
                 kind: "block",
                 assistantMessageIndex: blockIndex,
-              });
-              deliveredCounts.block++;
+              }, replyChunkSize);
             }
             blockIndex++;
           } catch {
@@ -264,11 +266,10 @@ async function httpDispatch({
         }
 
         if (deliver && finalToDeliver) {
-          await deliver(finalToDeliver, {
+          deliveredCounts.final += await deliverPayloadInChunks(deliver, finalToDeliver, {
             kind: "final",
             assistantMessageIndex: 0,
-          });
-          deliveredCounts.final++;
+          }, replyChunkSize);
           finalDelivered = true;
         }
       } catch {
@@ -276,11 +277,10 @@ async function httpDispatch({
         fullText = raw;
         const finalPayload = { text: fullText, isError: false };
         if (deliver) {
-          await deliver(finalPayload, {
+          deliveredCounts.final += await deliverPayloadInChunks(deliver, finalPayload, {
             kind: "final",
             assistantMessageIndex: 0,
-          });
-          deliveredCounts.final++;
+          }, replyChunkSize);
           finalDelivered = true;
         }
       }
@@ -300,11 +300,10 @@ async function httpDispatch({
       }
 
       if (deliver && finalToDeliver) {
-        await deliver(finalToDeliver, {
+        deliveredCounts.final += await deliverPayloadInChunks(deliver, finalToDeliver, {
           kind: "final",
           assistantMessageIndex: blockIndex,
-        });
-        deliveredCounts.final++;
+        }, replyChunkSize);
         finalDelivered = true;
       }
     }

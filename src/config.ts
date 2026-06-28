@@ -53,6 +53,8 @@ export type LiteGatewayConfig = {
   callbackSecret?: string;
   /** Callback token TTL in seconds (default 1800 = 30 minutes) */
   callbackTokenTTL?: number;
+  /** Max characters per outbound reply chunk (default 4000) */
+  replyChunkSize?: number;
   /** OpenClaw-compatible channel configs */
   channels?: Record<string, Record<string, unknown>>;
 };
@@ -111,6 +113,7 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
       callbackUrl: `http://${raw.callbackPublicHost ?? raw.callbackHost ?? "127.0.0.1"}:${raw.callbackPublicPort ?? raw.callbackPort ?? 3457}/ocg/callback`,
       callbackSecret: raw.callbackSecret,
       callbackTokenTTL: raw.callbackTokenTTL,
+      replyChunkSize: raw.replyChunkSize,
     },
   };
 }
@@ -139,6 +142,9 @@ export function applyConfigEnvOverrides(raw: LiteGatewayConfig): void {
   }
   if (raw.verbose && !process.env.OCG_VERBOSE) {
     process.env.OCG_VERBOSE = "1";
+  }
+  if (raw.replyChunkSize && !process.env.OCG_REPLY_CHUNK_SIZE) {
+    process.env.OCG_REPLY_CHUNK_SIZE = String(raw.replyChunkSize);
   }
 }
 

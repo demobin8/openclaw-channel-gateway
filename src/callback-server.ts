@@ -10,6 +10,7 @@
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { deliverPayloadInChunks } from "./reply-chunking.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -224,12 +225,13 @@ export async function startCallbackServer(
             ?? JSON.stringify(payload.reply);
       }
 
-      await deliver(
+      const deliveredChunks = await deliverPayloadInChunks(
+        deliver,
         { text, isError: payload.isError ?? false },
         { kind: "final", assistantMessageIndex: 0 },
       );
 
-      console.log(`[ocg] callback delivered (${text.length} chars)`);
+      console.log(`[ocg] callback delivered (${text.length} chars${deliveredChunks > 1 ? `, ${deliveredChunks} chunks` : ""})`);
       jsonBody(res, 200, { ok: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

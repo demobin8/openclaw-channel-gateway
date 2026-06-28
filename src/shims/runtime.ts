@@ -24,7 +24,8 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
-import type { DeliverFn } from "../callback-server.js";
+import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
+import type { DeliverFn } from "../reply-chunking.js";
 
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
 
@@ -357,6 +358,7 @@ async function dispatchReplyFromConfig(params: {
   const verbose =
     (liteGw.verbose as boolean) ||
     process.env.OCG_VERBOSE === "1";
+  const replyChunkSize = resolveReplyChunkSize(liteGw.replyChunkSize);
 
   // ── Log incoming message ──────────────────────────────────────────────
   console.log(`\n${"=".repeat(60)}`);
@@ -535,8 +537,14 @@ async function dispatchReplyFromConfig(params: {
 
     // Send final payload (skip if blocks already delivered the content incrementally)
     if (fullText && deliveredCounts.block === 0) {
-      dispatcher.sendFinalReply({ text: fullText, isError: false });
-      deliveredCounts.final++;
+      deliveredCounts.final += await deliverPayloadInChunks(
+        async (payload) => {
+          dispatcher.sendFinalReply(payload);
+        },
+        { text: fullText, isError: false },
+        { kind: "final", assistantMessageIndex: 0 },
+        replyChunkSize,
+      );
       finalDelivered = true;
     } else {
       console.warn(`[ocg] No text extracted from response`);
