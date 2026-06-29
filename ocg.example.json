@@ -15,6 +15,15 @@
           "botToken": "YOUR_BOT_TOKEN_HERE"
         }
       }
+    },
+
+    "_per-channel-agentUrl": "Each channel can override the global agentUrl:",
+    "qqbot": {
+      "_comment": "This channel uses its own agent endpoint instead of the global one",
+      "enabled": true,
+      "agentUrl": "http://127.0.0.1:8080/v1/chat/completions",
+      "appId": "YOUR_APP_ID",
+      "clientSecret": "YOUR_CLIENT_SECRET"
     }
   }
 }

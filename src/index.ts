@@ -61,15 +61,31 @@ export function gatewayStatus(): Record<string, unknown> {
   const cfg = loadConfig();
   const configured = cfg?.channels ? Object.keys(cfg.channels) : [];
 
+  // Collect per-channel agentUrls
+  const channelAgentUrls: Record<string, string> = {};
+  if (cfg?.channels) {
+    for (const [chId, chCfg] of Object.entries(cfg.channels)) {
+      const ch = chCfg as Record<string, unknown>;
+      if (ch.agentUrl && typeof ch.agentUrl === "string") {
+        channelAgentUrls[chId] = ch.agentUrl;
+      }
+    }
+  }
+
   return {
     configured: configured.length,
     running: running.length,
-    channels: running.map((b) => ({
-      id: b.channelId,
-      status: b.status,
-      uptime: b.startedAt ? Math.round((Date.now() - b.startedAt) / 1000) : 0,
-      error: b.error,
-    })),
+    channels: running.map((b) => {
+      // Show per-channel agentUrl if set, otherwise fall back to global
+      const chAgentUrl = channelAgentUrls[b.channelId] || cfg?.agentUrl || process.env.OCG_AGENT_URL || "(not set)";
+      return {
+        id: b.channelId,
+        status: b.status,
+        uptime: b.startedAt ? Math.round((Date.now() - b.startedAt) / 1000) : 0,
+        error: b.error,
+        agentUrl: chAgentUrl,
+      };
+    }),
     agentUrl: cfg?.agentUrl || process.env.OCG_AGENT_URL || "(not set)",
     model: cfg?.model || process.env.OCG_MODEL || "(not set)",
   };

@@ -25,6 +25,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
+import { resolveChannelAgentUrl } from "../config.js";
 import type { DeliverFn } from "../reply-chunking.js";
 
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
@@ -328,12 +329,13 @@ async function dispatchReplyFromConfig(params: {
   const from = String(ctx.From ?? "unknown");
   const sessionKey = String(ctx.SessionKey ?? "default");
 
-  // Resolve agent API URL from config or env
+  // Resolve channel id from session key (format: "channelId:accountId:userKey")
+  const channelId = sessionKey.split(":")[0] || undefined;
+
+  // Resolve agent API URL — per-channel override first, then global fallback
+  const agentUrl = resolveChannelAgentUrl(channelId, cfg);
+
   const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
-  const agentUrl =
-    (liteGw.agentUrl as string) ||
-    process.env.OCG_AGENT_URL ||
-    "http://127.0.0.1:11434/v1/chat/completions";
 
   const modelRaw =
     (liteGw.model as string | Record<string, unknown>) ||

@@ -91,8 +91,37 @@ npm install -g openclaw-channel-gateway
   }
 }
 ```
+### 渠道级 agentUrl
 
-也可以通过环境变量配置（环境变量优先级更高）：
+每个渠道可以覆盖全局 `agentUrl` 使用自己的端点地址。如果渠道没有配置 `agentUrl`，则回退到全局 `agentUrl`。
+
+**优先级**（从高到低）：
+
+1. 渠道级别 `channels.<id>.agentUrl`
+2. 全局 `agentUrl`
+3. 环境变量 `OCG_AGENT_URL`
+4. `http://127.0.0.1:11434/v1/chat/completions`（兜底）
+
+```json
+{
+  "agentUrl": "http://127.0.0.1:11434/v1/chat/completions",
+  "channels": {
+    "openclaw-weixin": {
+      "accounts": { "default": { "enabled": true } }
+    },
+    "qqbot": {
+      "enabled": true,
+      "agentUrl": "http://10.0.0.5:8080/v1/chat/completions",
+      "appId": "YOUR_APP_ID",
+      "clientSecret": "YOUR_CLIENT_SECRET"
+    }
+  }
+}
+```
+
+以上示例中，`openclaw-weixin` 使用全局端点，而 `qqbot` 走自己的 `agentUrl`。运行 `ocg status` 可在输出中看到每个渠道实际使用的 Agent URL。
+
+也可以通过环境变量配置（环境变量优先级高于全局配置，但低于渠道级 `agentUrl`）：
 
 | 环境变量 | 说明 |
 |---|---|

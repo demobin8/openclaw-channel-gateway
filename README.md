@@ -91,8 +91,37 @@ Create `ocg.json` (see `ocg.example.json` for reference):
   }
 }
 ```
+### Per-Channel agentUrl
 
-You can also configure via environment variables (env vars take precedence):
+Each channel can override the global `agentUrl` with its own endpoint. If a channel does not specify `agentUrl`, it falls back to the global `agentUrl`.
+
+**Priority** (highest to lowest):
+
+1. Channel-level `channels.<id>.agentUrl`
+2. Global `agentUrl`
+3. `OCG_AGENT_URL` env variable
+4. `http://127.0.0.1:11434/v1/chat/completions` (fallback)
+
+```json
+{
+  "agentUrl": "http://127.0.0.1:11434/v1/chat/completions",
+  "channels": {
+    "openclaw-weixin": {
+      "accounts": { "default": { "enabled": true } }
+    },
+    "qqbot": {
+      "enabled": true,
+      "agentUrl": "http://10.0.0.5:8080/v1/chat/completions",
+      "appId": "YOUR_APP_ID",
+      "clientSecret": "YOUR_CLIENT_SECRET"
+    }
+  }
+}
+```
+
+In this example, `openclaw-weixin` uses the global endpoint while `qqbot` routes to its own `agentUrl`. Run `ocg status` to see each channel's effective agent URL in the output.
+
+You can also configure via environment variables (env vars take precedence over global config, but per-channel `agentUrl` has the highest priority):
 
 | Env Variable | Description |
 |---|---|

@@ -268,7 +268,11 @@ function cmdStatus(args: Args = {}): void {
     const channels = s.channels as Array<Record<string, unknown>>;
     for (const c of channels) {
       const uptime = typeof c.uptime === "number" ? `${c.uptime}s` : "—";
-      console.log(`  ${c.id}  ${c.status}  uptime: ${uptime}`);
+      const chAgentUrl = c.agentUrl as string | undefined;
+      const agentInfo = chAgentUrl && chAgentUrl !== s.agentUrl
+        ? `  agent: ${chAgentUrl}`
+        : "";
+      console.log(`  ${c.id}  ${c.status}  uptime: ${uptime}${agentInfo}`);
     }
   }
 }

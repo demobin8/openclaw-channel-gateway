@@ -119,6 +119,36 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
 }
 
 /**
+ * Resolve the agent runtime URL for a specific channel.
+ *
+ * Priority:
+ *   1. Channel-level `agentUrl` in `cfg.channels.<channelId>.agentUrl`
+ *   2. Global `agentUrl` in `cfg.liteGateway.agentUrl`
+ *   3. `process.env.OCG_AGENT_URL`
+ *   4. Fallback: `http://127.0.0.1:11434/v1/chat/completions`
+ *
+ * @param channelId - Channel identifier extracted from SessionKey
+ * @param cfg       - Full OpenClaw config (with liteGateway + channels)
+ */
+export function resolveChannelAgentUrl(
+  channelId: string | undefined,
+  cfg: Record<string, unknown>,
+): string {
+  if (channelId) {
+    const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
+    const chCfg = channels?.[channelId];
+    if (chCfg?.agentUrl && typeof chCfg.agentUrl === "string") {
+      return chCfg.agentUrl;
+    }
+  }
+
+  const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
+  return (liteGw.agentUrl as string) ||
+    process.env.OCG_AGENT_URL ||
+    "http://127.0.0.1:11434/v1/chat/completions";
+}
+
+/**
  * Inject config-driven values into process.env as safe defaults.
  *
  * Some plugins use the openclaw runtime config (not our built config)
