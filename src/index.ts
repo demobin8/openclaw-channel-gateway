@@ -95,12 +95,16 @@ export function gatewayStatus(): Record<string, unknown> {
     }
   }
 
+  const agentType = cfg?.agentType ?? (cfg?.acp ? "acp" : process.env.OCG_AGENT_TYPE) ?? "http";
+
   return {
     configured: configured.length,
     running: new Set(running.map((b) => b.channelId)).size,
     channels: running.map((b) => {
+      const channelCfg = cfg?.channels?.[b.channelId] as Record<string, unknown> | undefined;
+      const channelAgentType = channelCfg?.agentType === "acp" || channelCfg?.acp ? "acp" : (channelCfg?.agentType ?? agentType);
       // Show per-channel agentUrl if set, otherwise fall back to global
-      const chAgentUrl = channelAgentUrls[b.channelId] || cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)";
+      const chAgentUrl = channelAgentType === "acp" ? "acp://stdio" : (channelAgentUrls[b.channelId] || cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)");
       return {
         id: b.channelId,
         accountId: "accountId" in b ? b.accountId : undefined,
@@ -108,10 +112,13 @@ export function gatewayStatus(): Record<string, unknown> {
         uptime: b.startedAt ? Math.round((Date.now() - b.startedAt) / 1000) : 0,
         error: b.error,
         agentUrl: chAgentUrl,
+        agentType: channelAgentType,
       };
     }),
     pid: processState?.pid,
-    agentUrl: cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)",
+    agentType,
+    agentUrl: agentType === "acp" ? "acp://stdio" : (cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)"),
+    acp: cfg?.acp,
     model: cfg?.model || processState?.model || process.env.OCG_MODEL || "(not set)",
   };
 }

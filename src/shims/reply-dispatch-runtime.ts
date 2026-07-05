@@ -24,7 +24,8 @@ export type {
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 
 import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
-import { resolveChannelAgentUrl } from "../config.js";
+import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl } from "../config.js";
+import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
 
 // ── HTTP dispatch implementation ────────────────────────────────────────
 
@@ -57,8 +58,10 @@ async function httpDispatch({
   // Resolve channel id from session key (format: "channelId:accountId:userKey")
   const channelId = sessionKey.split(":")[0] || undefined;
 
+  const agentType = resolveChannelAgentType(channelId, cfg);
+
   // Resolve agent API URL — per-channel override first, then global fallback
-  const agentUrl = resolveChannelAgentUrl(channelId, cfg);
+  const agentUrl = agentType === "http" ? resolveChannelAgentUrl(channelId, cfg) : "acp://stdio";
 
   const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
   const model =
@@ -109,6 +112,78 @@ async function httpDispatch({
     await onModelSelected?.(modelStr);
   } catch {
     // Not critical
+  }
+
+  // ── ACP stdio mode ─────────────────────────────────────────────────
+  if (agentType === "acp") {
+    const acpCfg = {
+      ...buildAcpConfigFromEnv(),
+      ...resolveChannelAcpConfig(channelId, cfg),
+      model: modelStr,
+    };
+    const agent = getAcpAgent(acpCfg);
+    let fullText = "";
+    let blockIndex = 0;
+    const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
+
+    try {
+      fullText = await agent.chat(sessionKey, body, {
+        onDelta: async (text) => {
+          if (!text) return;
+          const payload = { text, isError: false };
+          let finalPayload = payload;
+          if (beforeDeliver) {
+            const result = await beforeDeliver(payload, {
+              kind: "block",
+              assistantMessageIndex: blockIndex,
+            });
+            if (result === null) return;
+            if (result) finalPayload = result as typeof finalPayload;
+          }
+          if (deliver) {
+            deliveredCounts.block += await deliverPayloadInChunks(deliver, finalPayload, {
+              kind: "block",
+              assistantMessageIndex: blockIndex,
+            }, replyChunkSize);
+          }
+          blockIndex++;
+        },
+      });
+
+      const finalPayload = { text: fullText, isError: false };
+      let finalToDeliver = finalPayload;
+      if (beforeDeliver) {
+        const result = await beforeDeliver(finalPayload, {
+          kind: "final",
+          assistantMessageIndex: blockIndex,
+        });
+        if (result) finalToDeliver = result as typeof finalToDeliver;
+      }
+      if (deliver && finalToDeliver) {
+        deliveredCounts.final += await deliverPayloadInChunks(deliver, finalToDeliver, {
+          kind: "final",
+          assistantMessageIndex: blockIndex,
+        }, replyChunkSize);
+      }
+
+      console.log(`📤 [OUT:ACP] ${fullText.length} chars, ${deliveredCounts.block} blocks`);
+      console.log(`${"=".repeat(60)}\n`);
+      return { queuedFinal: true, counts: deliveredCounts, acp: agent.info() };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ocg] ACP dispatch error: ${message}`);
+      if (deliver) {
+        await deliver({ text: `ACP agent error: ${message}`, isError: true }, {
+          kind: "final",
+          assistantMessageIndex: 0,
+        }).catch(() => undefined);
+      }
+      return {
+        queuedFinal: false,
+        counts: { block: 0, final: 1, tool: 0 },
+        failedCounts: { final: 1 },
+      };
+    }
   }
 
   // ── Async (fire & forget) mode ──────────────────────────────────────

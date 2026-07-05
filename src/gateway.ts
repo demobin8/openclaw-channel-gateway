@@ -13,6 +13,7 @@ import {
   listRunningAccounts,
 } from "./plugin-loader.js";
 import { startCallbackServer, stopCallbackServer, isCallbackServerRunning } from "./callback-server.js";
+import { stopAllAcpAgents } from "./acp-agent.js";
 
 // ── Public API ────────────────────────────────────────────────────────────
 
@@ -61,7 +62,12 @@ export function listRunningChannels() {
   }));
 }
 
-export { listRunningAccounts, stopAllChannels as stopAll };
+export { listRunningAccounts };
+
+export async function stopAll(): Promise<void> {
+  await stopAllChannels();
+  stopAllAcpAgents();
+}
 
 /**
  * Start all enabled channels from config.

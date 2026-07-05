@@ -25,7 +25,8 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
-import { resolveChannelAgentUrl } from "../config.js";
+import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl } from "../config.js";
+import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
 import type { DeliverFn } from "../reply-chunking.js";
 
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
@@ -332,8 +333,10 @@ async function dispatchReplyFromConfig(params: {
   // Resolve channel id from session key (format: "channelId:accountId:userKey")
   const channelId = sessionKey.split(":")[0] || undefined;
 
+  const agentType = resolveChannelAgentType(channelId, cfg);
+
   // Resolve agent API URL — per-channel override first, then global fallback
-  const agentUrl = resolveChannelAgentUrl(channelId, cfg);
+  const agentUrl = agentType === "http" ? resolveChannelAgentUrl(channelId, cfg) : "acp://stdio";
 
   const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
 
@@ -376,6 +379,52 @@ async function dispatchReplyFromConfig(params: {
     console.log(`       Body: ${preview}`);
   }
   console.log(`       → ${modelStr} @ ${agentUrl}`);
+
+  // ── ACP stdio mode ─────────────────────────────────────────────────
+  if (agentType === "acp") {
+    const acpCfg = {
+      ...buildAcpConfigFromEnv(),
+      ...resolveChannelAcpConfig(channelId, cfg),
+      model: modelStr,
+    };
+    const agent = getAcpAgent(acpCfg);
+    let fullText = "";
+    const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
+
+    try {
+      fullText = await agent.chat(sessionKey, body, {
+        onDelta: async (text) => {
+          if (!text || params.replyOptions?.disableBlockStreaming === true) return;
+          dispatcher.sendBlockReply({ text, isError: false });
+          deliveredCounts.block++;
+        },
+      });
+
+      if (fullText && deliveredCounts.block === 0) {
+        deliveredCounts.final += await deliverPayloadInChunks(
+          async (payload) => {
+            dispatcher.sendFinalReply(payload);
+          },
+          { text: fullText, isError: false },
+          { kind: "final", assistantMessageIndex: 0 },
+          replyChunkSize,
+        );
+      }
+
+      console.log(`📤 [OUT:ACP] ${fullText.length} chars, ${deliveredCounts.block} blocks`);
+      console.log(`${"=".repeat(60)}\n`);
+      return { queuedFinal: true, counts: deliveredCounts };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ocg] ACP dispatch error: ${message}`);
+      try {
+        dispatcher.sendFinalReply({ text: `ACP agent error: ${message}`, isError: true });
+      } catch {
+        // Best effort.
+      }
+      return { queuedFinal: true, counts: { block: 0, final: 1, tool: 0 } };
+    }
+  }
 
   // ── Async (fire & forget) mode ──────────────────────────────────────
   const isAsync = Boolean(liteGw.async);

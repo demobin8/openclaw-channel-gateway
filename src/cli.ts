@@ -6,6 +6,7 @@
  *   ocg stop                      停止全部
  *   ocg restart                   重启全部
  *   ocg status                    网关状态
+ *   ocg chat <message>            从终端发送消息走 HTTP/ACP dispatch
  *   ocg version                   版本
  *   ocg upgrade                   升级 OCG CLI
  *
@@ -52,6 +53,8 @@ import {
 } from "./plugin-loader.js";
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 import { join, resolve } from "node:path";
 
 function readPackageVersion(): string {
@@ -89,6 +92,8 @@ function printHelp(): void {
   console.log("  stop                          Stop all channels");
   console.log("  restart                       Restart all channels");
   console.log("  status                        Show gateway status");
+  console.log("  chat [message] [--interactive|-i]  Send terminal input through HTTP/ACP dispatch");
+  console.log("                                Options: --channel <id>, --agent-type <http|acp>, --agent-url <url>, --acp-command <cmd>");
   console.log("  test                          Run dispatch smoke test");
   console.log("  version                       Print version");
   console.log("  upgrade [--package-manager <pm>] [--target <version>] [--local] [--dry-run]");
@@ -111,7 +116,11 @@ function printHelp(): void {
   console.log("");
   console.log("Environment:");
   console.log("  OCG_CONFIG_PATH     Config file path");
-  console.log("  OCG_AGENT_URL       Agent API URL");
+  console.log("  OCG_AGENT_TYPE      Agent transport: http or acp");
+  console.log("  OCG_AGENT_URL       Agent API URL (HTTP mode)");
+  console.log("  OCG_ACP_COMMAND     ACP binary (ACP mode)");
+  console.log("  OCG_ACP_ARGS        ACP args as JSON array (ACP mode)");
+  console.log("  OCG_ACP_CWD         ACP working directory (ACP mode)");
   console.log("  OCG_MODEL           Model name");
   console.log("  OCG_API_KEY         API key");
   console.log("  OCG_TELEGRAM_TOKEN  Telegram bot token");
@@ -147,6 +156,11 @@ function parseArgs(raw: string[]): { command: string; args: Args } {
     } else {
       positional.push(a);
     }
+  }
+
+  const first = positional[0];
+  if (first === "chat") {
+    return { command: positional.length > 1 ? `chat ${positional.slice(1).join(" ")}` : "chat", args: flags };
   }
 
   return { command: positional.join(" "), args: flags };
@@ -388,6 +402,7 @@ function cmdStatus(args: Args = {}): void {
   if (args["json"]) {
     console.log(JSON.stringify(s, null, 2));
   } else {
+    console.log(`Agent type: ${s.agentType ?? "http"}`);
     console.log(`Agent:  ${s.agentUrl}`);
     console.log(`Model:  ${s.model}`);
     console.log(`Channels configured: ${s.configured}, running: ${s.running}`);
@@ -400,6 +415,139 @@ function cmdStatus(args: Args = {}): void {
         : "";
       console.log(`  ${c.id}  ${c.status}  uptime: ${uptime}${agentInfo}`);
     }
+  }
+}
+
+function resolveChatMessage(command: string, args: Args): string {
+  const flagMessage = args.message ?? args.m;
+  if (typeof flagMessage === "string") return flagMessage;
+  if (command === "chat") return "";
+  if (command.startsWith("chat ")) return command.slice("chat ".length).trim();
+  return "";
+}
+
+function createTerminalDispatchContext(message: string, args: Args): Record<string, unknown> {
+  const channelId = typeof args.channel === "string" ? args.channel : "terminal";
+  const accountId = typeof args.account === "string" ? args.account : "default";
+  const userId = typeof args.user === "string" ? args.user : "terminal";
+  const sessionKey = typeof args.session === "string"
+    ? args.session
+    : `${channelId}:${accountId}:${userId}`;
+
+  return {
+    Body: message,
+    BodyForAgent: message,
+    CommandBody: message,
+    RawBody: message,
+    From: `${channelId}:${userId}`,
+    SessionKey: sessionKey,
+  };
+}
+
+async function dispatchTerminalMessage(message: string, args: Args): Promise<string> {
+  const rawCfg = loadConfig() ?? {};
+  if (typeof args["agent-type"] === "string") rawCfg.agentType = args["agent-type"] === "acp" ? "acp" : "http";
+  if (typeof args["agent-url"] === "string") rawCfg.agentUrl = args["agent-url"];
+  if (typeof args.model === "string") rawCfg.model = args.model;
+  if (typeof args["api-key"] === "string") rawCfg.apiKey = args["api-key"];
+  if (typeof args["acp-command"] === "string") {
+    rawCfg.acp = { ...(rawCfg.acp ?? {}), command: args["acp-command"] };
+    rawCfg.agentType = "acp";
+  }
+  if (typeof args["acp-args"] === "string") {
+    try {
+      rawCfg.acp = { ...(rawCfg.acp ?? {}), args: JSON.parse(args["acp-args"]) as string[] };
+    } catch {
+      rawCfg.acp = { ...(rawCfg.acp ?? {}), args: args["acp-args"].split(" ").filter(Boolean) };
+    }
+  }
+  if (typeof args["acp-cwd"] === "string") {
+    rawCfg.acp = { ...(rawCfg.acp ?? {}), cwd: args["acp-cwd"] };
+  }
+
+  applyConfigEnvOverrides(rawCfg);
+  const cfg = buildOpenClawConfig(rawCfg);
+  const { dispatchReplyWithBufferedBlockDispatcher } =
+    await import("./shims/reply-dispatch-runtime.js");
+
+  let finalText = "";
+  const blockTexts: string[] = [];
+  const quiet = args.quiet === true || args.q === true;
+  const showBlocks = args.blocks === true || args.stream === true || args.verbose === true;
+
+  const result = await dispatchReplyWithBufferedBlockDispatcher({
+    ctx: createTerminalDispatchContext(message, args),
+    cfg,
+    dispatcherOptions: {
+      onModelSelected: async (model: string) => {
+        if (!quiet) console.log(`[ocg:chat] model=${model}`);
+      },
+      deliver: async (payload: Record<string, unknown>, meta: Record<string, unknown>) => {
+        const text = String(payload.text ?? "");
+        if (meta.kind === "block") {
+          blockTexts.push(text);
+          if (showBlocks) console.log(`[block] ${text}`);
+          return;
+        }
+        if (meta.kind === "final") {
+          finalText = text;
+          return;
+        }
+        if (!quiet) console.log(`[${String(meta.kind ?? "payload")}] ${text}`);
+      },
+    },
+  });
+
+  if (!quiet) {
+    const counts = result.counts ? ` counts=${JSON.stringify(result.counts)}` : "";
+    console.log(`[ocg:chat] done${counts}`);
+  }
+
+  return finalText || blockTexts.join("");
+}
+
+async function cmdChat(command: string, args: Args): Promise<void> {
+  const interactive = args.interactive === true || args.i === true;
+  const { stopAllAcpAgents } = await import("./acp-agent.js");
+
+  if (!interactive) {
+    let message = resolveChatMessage(command, args);
+    let rl: ReturnType<typeof createInterface> | undefined;
+    if (!message && input.isTTY) {
+      rl = createInterface({ input, output });
+      message = (await rl.question("> ")).trim();
+    }
+    if (!message) {
+      rl?.close();
+      console.error("Usage: ocg chat <message> [--channel <id>] [--account <id>] [--session <key>]");
+      console.error("       ocg chat --interactive [--channel <id>] [--account <id>]");
+      process.exit(1);
+    }
+    try {
+      const reply = await dispatchTerminalMessage(message, args);
+      console.log("\n--- final ---");
+      console.log(reply);
+    } finally {
+      rl?.close();
+      stopAllAcpAgents();
+    }
+    return;
+  }
+
+  const rl = createInterface({ input, output });
+  console.log("[ocg:chat] Interactive terminal chat. Type /exit or /quit to leave.");
+  try {
+    while (true) {
+      const message = (await rl.question("> ")).trim();
+      if (!message) continue;
+      if (message === "/exit" || message === "/quit") break;
+      const reply = await dispatchTerminalMessage(message, args);
+      console.log("\n--- final ---");
+      console.log(reply);
+    }
+  } finally {
+    rl.close();
+    stopAllAcpAgents();
   }
 }
 
@@ -918,9 +1066,11 @@ async function run(): Promise<void> {
     case "stop": return cmdStop();
     case "restart": return cmdRestart();
     case "status": return cmdStatus(args);
+    case "chat": return cmdChat(command, args);
     case "test": return cmdTest();
     case "upgrade": return cmdUpgrade(args);
   }
+  if (command.startsWith("chat ")) return cmdChat(command, args);
 
   // plugins subcommands
   if (command.startsWith("plugins ")) {

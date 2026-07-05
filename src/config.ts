@@ -26,9 +26,28 @@ import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+export type AcpGatewayConfig = {
+  /** ACP-capable binary, e.g. claude-agent-acp, codex-acp, codex */
+  command?: string;
+  /** Extra command args, e.g. ["app-server", "--listen", "stdio://"] for Codex */
+  args?: string[];
+  /** Working directory used by ACP sessions */
+  cwd?: string;
+  /** Extra environment variables for the ACP subprocess */
+  env?: Record<string, string>;
+  /** Request timeout in milliseconds (default 300000) */
+  timeoutMs?: number;
+};
+
+export type AgentType = "http" | "acp";
+
 export type LiteGatewayConfig = {
-  /** OpenAI-compatible agent API endpoint */
+  /** Agent transport type. Defaults to "http" for backward compatibility. */
+  agentType?: AgentType;
+  /** OpenAI-compatible agent API endpoint (HTTP mode) */
   agentUrl?: string;
+  /** ACP subprocess settings (ACP mode) */
+  acp?: AcpGatewayConfig;
   /** Model name */
   model?: string;
   /** API key for the agent */
@@ -103,7 +122,9 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
   return {
     ...raw,
     liteGateway: {
+      agentType: raw.agentType ?? (raw.acp ? "acp" : "http"),
       agentUrl: raw.agentUrl,
+      acp: raw.acp,
       model: raw.model,
       apiKey: raw.apiKey,
       verbose: raw.verbose,
@@ -130,6 +151,60 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
  * @param channelId - Channel identifier extracted from SessionKey
  * @param cfg       - Full OpenClaw config (with liteGateway + channels)
  */
+export function resolveChannelAgentType(
+  channelId: string | undefined,
+  cfg: Record<string, unknown>,
+): AgentType {
+  if (channelId) {
+    const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
+    const chCfg = channels?.[channelId];
+    if (chCfg?.agentType === "acp" || chCfg?.agentType === "http") {
+      return chCfg.agentType;
+    }
+    if (chCfg?.acp && typeof chCfg.acp === "object") {
+      return "acp";
+    }
+  }
+
+  const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
+  if (liteGw.agentType === "acp" || liteGw.agentType === "http") {
+    return liteGw.agentType;
+  }
+  if (liteGw.acp && typeof liteGw.acp === "object") {
+    return "acp";
+  }
+  if (process.env.OCG_AGENT_TYPE === "acp") return "acp";
+  return "http";
+}
+
+export function resolveChannelAcpConfig(
+  channelId: string | undefined,
+  cfg: Record<string, unknown>,
+): AcpGatewayConfig {
+  const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
+  const globalAcp = liteGw.acp && typeof liteGw.acp === "object"
+    ? (liteGw.acp as AcpGatewayConfig)
+    : {};
+
+  let channelAcp: AcpGatewayConfig = {};
+  if (channelId) {
+    const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
+    const chCfg = channels?.[channelId];
+    if (chCfg?.acp && typeof chCfg.acp === "object") {
+      channelAcp = chCfg.acp as AcpGatewayConfig;
+    }
+  }
+
+  return {
+    ...globalAcp,
+    ...channelAcp,
+    model: (channelAcp as Record<string, unknown>).model as string | undefined ??
+      (globalAcp as Record<string, unknown>).model as string | undefined ??
+      (liteGw.model as string | undefined) ??
+      process.env.OCG_MODEL,
+  } as AcpGatewayConfig & { model?: string };
+}
+
 export function resolveChannelAgentUrl(
   channelId: string | undefined,
   cfg: Record<string, unknown>,
@@ -158,6 +233,28 @@ export function resolveChannelAgentUrl(
  * Does NOT overwrite explicitly set env vars.
  */
 export function applyConfigEnvOverrides(raw: LiteGatewayConfig): void {
+  const agentType = raw.agentType ?? (raw.acp ? "acp" : undefined);
+  if (agentType && !process.env.OCG_AGENT_TYPE) {
+    process.env.OCG_AGENT_TYPE = agentType;
+  }
+  if (raw.acp?.command && !process.env.OCG_ACP_COMMAND) {
+    process.env.OCG_ACP_COMMAND = raw.acp.command;
+  }
+  if (raw.acp?.args && !process.env.OCG_ACP_ARGS) {
+    process.env.OCG_ACP_ARGS = JSON.stringify(raw.acp.args);
+  }
+  if (raw.acp?.cwd && !process.env.OCG_ACP_CWD) {
+    process.env.OCG_ACP_CWD = raw.acp.cwd;
+  }
+  if (raw.acp?.timeoutMs && !process.env.OCG_ACP_TIMEOUT_MS) {
+    process.env.OCG_ACP_TIMEOUT_MS = String(raw.acp.timeoutMs);
+  }
+  if (raw.acp?.env) {
+    for (const [key, value] of Object.entries(raw.acp.env)) {
+      const envKey = `OCG_ACP_ENV_${key}`;
+      if (!process.env[envKey]) process.env[envKey] = value;
+    }
+  }
   if (raw.agentUrl && !process.env.OCG_AGENT_URL) {
     process.env.OCG_AGENT_URL = raw.agentUrl;
     console.log(`[ocg] OCG_AGENT_URL set from config: ${raw.agentUrl}`);

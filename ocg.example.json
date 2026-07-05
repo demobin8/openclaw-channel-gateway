@@ -1,5 +1,13 @@
 {
+  "agentType": "http",
   "agentUrl": "http://127.0.0.1:11434/v1/chat/completions",
+  "_acpExample": "For ACP mode set agentType=acp and configure acp.command, e.g. claude-agent-acp, codex-acp, or codex app-server.",
+  "acp": {
+    "command": "claude-agent-acp",
+    "args": [],
+    "cwd": "./workspace",
+    "env": {}
+  },
   "model": "gpt-4o",
   "apiKey": "",
   "verbose": false,
@@ -17,10 +25,11 @@
       }
     },
 
-    "_per-channel-agentUrl": "Each channel can override the global agentUrl:",
+    "_per-channel-agentUrl": "Each channel can override the global agent transport/endpoint:",
     "qqbot": {
       "_comment": "This channel uses its own agent endpoint instead of the global one",
       "enabled": true,
+      "agentType": "http",
       "agentUrl": "http://127.0.0.1:8080/v1/chat/completions",
       "appId": "YOUR_APP_ID",
       "clientSecret": "YOUR_CLIENT_SECRET"
