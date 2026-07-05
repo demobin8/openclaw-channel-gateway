@@ -24,7 +24,7 @@ export type {
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 
 import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
-import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl } from "../config.js";
+import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl, resolveChannelIdFromContext } from "../config.js";
 import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
 
 // ── HTTP dispatch implementation ────────────────────────────────────────
@@ -55,8 +55,8 @@ async function httpDispatch({
   const from = String(ctx.From ?? "unknown");
   const sessionKey = String(ctx.SessionKey ?? "default");
 
-  // Resolve channel id from session key (format: "channelId:accountId:userKey")
-  const channelId = sessionKey.split(":")[0] || undefined;
+  // Resolve channel id from explicit context fields first, then SessionKey/From.
+  const channelId = resolveChannelIdFromContext(ctx) || sessionKey.split(":")[0] || undefined;
 
   const agentType = resolveChannelAgentType(channelId, cfg);
 
@@ -127,9 +127,10 @@ async function httpDispatch({
     const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
 
     try {
+      const streamBlocks = liteGw.acpStreamBlocks === true || ctx.AcpStreamBlocks === true;
       fullText = await agent.chat(sessionKey, body, {
         onDelta: async (text) => {
-          if (!text) return;
+          if (!streamBlocks || !text) return;
           const payload = { text, isError: false };
           let finalPayload = payload;
           if (beforeDeliver) {

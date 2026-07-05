@@ -151,13 +151,32 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
  * @param channelId - Channel identifier extracted from SessionKey
  * @param cfg       - Full OpenClaw config (with liteGateway + channels)
  */
+function resolveChannelSection(
+  channelId: string | undefined,
+  cfg: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (!channelId) return undefined;
+  const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
+  const direct = channels?.[channelId];
+  if (direct) return direct;
+
+  // Some plugin dispatchers pass a reduced/normalized runtime config where
+  // channel sections are not preserved. In that case, fall back to the source
+  // lite gateway config on disk for transport selection.
+  try {
+    const raw = loadConfig();
+    return raw?.channels?.[channelId] as Record<string, unknown> | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveChannelAgentType(
   channelId: string | undefined,
   cfg: Record<string, unknown>,
 ): AgentType {
   if (channelId) {
-    const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
-    const chCfg = channels?.[channelId];
+    const chCfg = resolveChannelSection(channelId, cfg);
     if (chCfg?.agentType === "acp" || chCfg?.agentType === "http") {
       return chCfg.agentType;
     }
@@ -188,8 +207,7 @@ export function resolveChannelAcpConfig(
 
   let channelAcp: AcpGatewayConfig = {};
   if (channelId) {
-    const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
-    const chCfg = channels?.[channelId];
+    const chCfg = resolveChannelSection(channelId, cfg);
     if (chCfg?.acp && typeof chCfg.acp === "object") {
       channelAcp = chCfg.acp as AcpGatewayConfig;
     }
@@ -205,13 +223,39 @@ export function resolveChannelAcpConfig(
   } as AcpGatewayConfig & { model?: string };
 }
 
+function contextString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" || typeof value === "boolean" || value instanceof String) {
+    const text = String(value).trim();
+    return text || undefined;
+  }
+  return undefined;
+}
+
+function channelPrefix(value: unknown): string | undefined {
+  const text = contextString(value);
+  if (!text || !text.includes(":")) return undefined;
+  const first = text.split(":")[0]?.trim();
+  return first && first !== "agent" ? first : undefined;
+}
+
+export function resolveChannelIdFromContext(ctx: Record<string, unknown>): string | undefined {
+  const direct = contextString(ctx.ChannelId ?? ctx.channelId ?? ctx.Channel ?? ctx.channel) ??
+    contextString(ctx.OriginatingChannel ?? ctx.Provider ?? ctx.Surface);
+  if (direct && direct !== "agent") return direct;
+
+  return channelPrefix(ctx.From ?? ctx.from) ??
+    channelPrefix(ctx.To ?? ctx.to) ??
+    channelPrefix(ctx.SessionKey ?? ctx.sessionKey ?? ctx.routeSessionKey);
+}
+
 export function resolveChannelAgentUrl(
   channelId: string | undefined,
   cfg: Record<string, unknown>,
 ): string {
   if (channelId) {
-    const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
-    const chCfg = channels?.[channelId];
+    const chCfg = resolveChannelSection(channelId, cfg);
     if (chCfg?.agentUrl && typeof chCfg.agentUrl === "string") {
       return chCfg.agentUrl;
     }

@@ -1,12 +1,12 @@
 # OpenClaw Channel Gateway (OCG)
 
-轻量级 IM 渠道网关 — 将 OpenClaw 的 Channel 生态桥接到任何 OpenAI 兼容的 Agent API。
+轻量级 IM 渠道网关 — 将 OpenClaw 的 Channel 生态桥接到任何 OpenAI 兼容的 Agent API 或 ACP stdio Agent。
 
 > [English Documentation](README.md)
 
-OpenClaw 拥有最丰富的 IM 渠道生态（Telegram、Discord、微信、钉钉、QQ 等），但它的 Agent 引擎是内置的。OCG 作为一层轻量网关，直接复用 OpenClaw 的 Channel 插件，将收到的消息通过 HTTP 转发给你配置的任意 OpenAI 兼容 Agent（任何 LLM Provider），再把回复送回 IM 渠道。
+OpenClaw 拥有最丰富的 IM 渠道生态（Telegram、Discord、微信、钉钉、QQ 等），但它的 Agent 引擎是内置的。OCG 作为一层轻量网关，直接复用 OpenClaw 的 Channel 插件，将收到的消息通过 HTTP 转发给你配置的任意 OpenAI 兼容 Agent，或通过 ACP 转发给本地 stdio Agent，再把回复送回 IM 渠道。
 
-> 一句话：让所有兼容 OpenAI API 的 LLM Provider 都能享用 OpenClaw 的 Channel 生态。
+> 一句话：让所有兼容 OpenAI API 的 LLM Provider 或支持 ACP 的编程 Agent 都能享用 OpenClaw 的 Channel 生态。
 
 ---
 
@@ -31,11 +31,11 @@ OpenClaw 拥有最丰富的 IM 渠道生态（Telegram、Discord、微信、钉�
 │  │   Hook      │  │  Shims       │  │  Server     │  │
 │  └─────────────┘  └──────────────┘  └─────────────┘  │
 └──────────────────────┬───────────────────────────────┘
-                       │  HTTP (SSE streaming)
+                       │  HTTP (SSE streaming) 或 ACP stdio
                        ▼
 ┌──────────────────────────────────────────────────────┐
-│     任何 OpenAI 兼容 Agent API                          │
-│     (OpenAI / Ollama / vLLM / LiteLLM / ...)          │
+│     任何 OpenAI 兼容 Agent API / ACP Agent              │
+│     (OpenAI / Ollama / vLLM / LiteLLM / Core AI / ...)│
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -91,16 +91,21 @@ npm install -g openclaw-channel-gateway
   }
 }
 ```
-### 渠道级 agentUrl
+### 渠道级 Agent 传输方式
 
-每个渠道可以覆盖全局 `agentUrl` 使用自己的端点地址。如果渠道没有配置 `agentUrl`，则回退到全局 `agentUrl`。
+OCG 支持两种 Agent 传输方式：
+
+- `http` — OpenAI 兼容 Chat Completions 端点。HTTP 模式可将 SSE 流式响应逐块投递到 IM 渠道。
+- `acp` — 本地 ACP stdio Agent 子进程。ACP 模式会保持一个长期运行的子进程，并按 IM 会话复用 ACP session；默认会缓冲流式 delta，只向 IM 发送一条最终回复。
+
+每个渠道可以覆盖全局 `agentType`、`agentUrl` 和 `acp` 配置。如果渠道没有配置覆盖项，则回退到全局配置。
 
 **优先级**（从高到低）：
 
-1. 渠道级别 `channels.<id>.agentUrl`
-2. 全局 `agentUrl`
-3. 环境变量 `OCG_AGENT_URL`
-4. `http://127.0.0.1:11434/v1/chat/completions`（兜底）
+1. 渠道级别 `channels.<id>.agentType` / `agentUrl` / `acp`
+2. 全局 `agentType` / `agentUrl` / `acp`
+3. 环境变量，例如 `OCG_AGENT_URL`
+4. `http://127.0.0.1:11434/v1/chat/completions`（HTTP URL 兜底）
 
 ```json
 {
@@ -119,13 +124,54 @@ npm install -g openclaw-channel-gateway
 }
 ```
 
-以上示例中，`openclaw-weixin` 使用全局端点，而 `qqbot` 走自己的 `agentUrl`。运行 `ocg status` 可在输出中看到每个渠道实际使用的 Agent URL。
+以上示例中，`openclaw-weixin` 使用全局端点，而 `qqbot` 走自己的 `agentUrl`。运行 `ocg status` 可在输出中看到每个渠道实际使用的 Agent URL 和传输方式。
 
-也可以通过环境变量配置（环境变量优先级高于全局配置，但低于渠道级 `agentUrl`）：
+#### ACP stdio Agent
+
+使用 `agentType: "acp"` 可以把消息路由到支持 ACP 的本地命令，而不是 HTTP。该配置可以放在全局，也可以放在某个渠道下：
+
+```json
+{
+  "agentType": "http",
+  "agentUrl": "http://127.0.0.1:11434/v1/chat/completions",
+  "channels": {
+    "openclaw-weixin": {
+      "accounts": { "default": { "enabled": true } }
+    },
+    "qqbot": {
+      "enabled": true,
+      "agentType": "acp",
+      "model": "core-ai-cli",
+      "acp": {
+        "command": "core-ai-cli",
+        "args": ["--acp-agent"],
+        "cwd": "D:/core-ai"
+      },
+      "appId": "YOUR_APP_ID",
+      "clientSecret": "YOUR_CLIENT_SECRET"
+    }
+  }
+}
+```
+
+ACP 配置项：
+
+| 配置项 | 说明 |
+|---|---|
+| `command` | ACP 可执行命令，例如 `core-ai-cli`、`claude-agent-acp`、`codex-acp` 或 `codex` |
+| `args` | 命令参数，例如 `["--acp-agent"]` |
+| `cwd` | ACP 子进程和 session 使用的工作目录 |
+| `env` | 传给子进程的额外环境变量 |
+| `timeoutMs` | 请求超时时间，单位毫秒；默认 300000 |
+
+ACP 模式默认会缓冲流式 delta，并只向 IM 渠道发送一条最终回复。仅当你明确希望把 ACP 中间块作为 IM 消息发送时，才设置 `acpStreamBlocks: true`。
+
+也可以通过环境变量配置（环境变量优先级高于全局配置，但低于渠道级配置）：
 
 | 环境变量 | 说明 |
 |---|---|
 | `OCG_AGENT_URL` | Agent API 地址 |
+| `OCG_AGENT_TYPE` | Agent 传输方式：`http` 或 `acp` |
 | `OCG_MODEL` | 模型名称 |
 | `OCG_API_KEY` | API Key |
 | `OCG_VERBOSE` | 详细日志 (`1` 启用) |
@@ -198,7 +244,7 @@ ocg plugins list
 
 ## 调度模式
 
-### 同步模式（默认）
+### 同步 HTTP 模式（默认）
 
 收到消息 → HTTP POST 到 Agent API → 流式接收 SSE 响应 → 逐块投递到 IM 渠道。
 
@@ -210,7 +256,20 @@ ocg plugins list
         Text: 你好！有什么可以帮助你的吗？
 ```
 
-### 异步模式（Fire & Forget）
+### ACP 模式
+
+收到消息 → 发送 prompt 到配置的 ACP stdio 子进程 → 缓冲流式 delta → 向 IM 渠道投递一条最终回复。
+
+```
+📥 [IN]  From: qqbot:c2c:user  |  Session: agent:main:main
+       Body: 执行部署检查
+       → core-ai-cli @ acp://stdio
+📤 [OUT:ACP] 128 chars, 0 blocks
+```
+
+ACP 模式从 IM 渠道视角看是同步请求/响应。OCG 会在多条消息之间保持 ACP 进程存活，并为同一个 IM 会话复用 ACP session。
+
+### 异步 HTTP 模式（Fire & Forget）
 
 当 Agent Runtime 需要执行耗时任务（如爬虫、复杂推理、多步工具调用）时，同步 HTTP 连接可能超时。异步模式通过解耦请求转发和回复投递来解决这个问题。
 
@@ -342,10 +401,10 @@ server.listen(8080);
 OCG 通过三层拦截实现与 OpenClaw Channel 插件的完全兼容：
 
 1. **源码级拦截（ESM Loader Hook）**
-   当插件代码导入 `openclaw/plugin-sdk/*` 时，自动重定向到 OCG 的 shim 模块。Shim 保留所有真实的工具函数（路由、命令检测、会话等），只替换 dispatch 函数为 HTTP 转发。
+   当插件代码导入 `openclaw/plugin-sdk/*` 时，自动重定向到 OCG 的 shim 模块。Shim 保留所有真实的工具函数（路由、命令检测、会话等），只替换 dispatch 函数为 OCG 的 HTTP/ACP 转发。
 
 2. **Chunk 级拦截**
-   对于已编译的 OpenClaw chunk，loader hook 直接替换源码，以 OCG 的 HTTP dispatch 实现替代内置 Agent 引擎。
+   对于已编译的 OpenClaw chunk，loader hook 直接替换源码，以 OCG 的 dispatch 实现替代内置 Agent 引擎。
 
 3. **插件运行时**
    OCG 构造了一个完整的 `PluginRuntime` 对象（in-memory store、logger、reply pipeline、session、routing、commands 等），Channel 插件完全感知不到自己运行在网关模式下。

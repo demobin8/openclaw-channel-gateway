@@ -25,7 +25,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
-import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl } from "../config.js";
+import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl, resolveChannelIdFromContext } from "../config.js";
 import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
 import type { DeliverFn } from "../reply-chunking.js";
 
@@ -330,8 +330,8 @@ async function dispatchReplyFromConfig(params: {
   const from = String(ctx.From ?? "unknown");
   const sessionKey = String(ctx.SessionKey ?? "default");
 
-  // Resolve channel id from session key (format: "channelId:accountId:userKey")
-  const channelId = sessionKey.split(":")[0] || undefined;
+  // Resolve channel id from explicit context fields first, then SessionKey/From.
+  const channelId = resolveChannelIdFromContext(ctx) || sessionKey.split(":")[0] || undefined;
 
   const agentType = resolveChannelAgentType(channelId, cfg);
 
@@ -392,9 +392,10 @@ async function dispatchReplyFromConfig(params: {
     const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
 
     try {
+      const streamBlocks = liteGw.acpStreamBlocks === true || ctx.AcpStreamBlocks === true;
       fullText = await agent.chat(sessionKey, body, {
         onDelta: async (text) => {
-          if (!text || params.replyOptions?.disableBlockStreaming === true) return;
+          if (!streamBlocks || !text || params.replyOptions?.disableBlockStreaming === true) return;
           dispatcher.sendBlockReply({ text, isError: false });
           deliveredCounts.block++;
         },
@@ -686,6 +687,7 @@ async function recordInboundSession(_params: Record<string, unknown>): Promise<v
 export function createPluginRuntime(
   dispatchFn?: (ctx: Record<string, unknown>) => Promise<unknown>,
   hostVersion = "unknown",
+  hostChannelId?: string,
 ): Record<string, unknown> {
   const stores = new Map<string, InMemoryStore>();
 
@@ -940,7 +942,12 @@ export function createPluginRuntime(
           return { admission: { kind: "drop", reason: "ingest-null" }, dispatched: false };
         }
 
-        console.log(`[ocg] inbound.run: message from adapter, id=${input.id}, textForAgent=${String(input.textForAgent ?? "").slice(0, 60)}`);
+        const effectiveHostChannelId = typeof params.channelId === "string" ? params.channelId : hostChannelId;
+        if (effectiveHostChannelId && typeof input === "object" && input !== null && !("channelId" in input)) {
+          (input as Record<string, unknown>).channelId = effectiveHostChannelId;
+        }
+
+        console.log(`[ocg] inbound.run: message from adapter, id=${input.id}, channelId=${effectiveHostChannelId ?? "(unknown)"}, textForAgent=${String(input.textForAgent ?? "").slice(0, 60)}`);
 
         // Call resolveTurn to get the dispatch function
         const resolveTurnFn = adapter.resolveTurn as

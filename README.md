@@ -1,12 +1,12 @@
 # OpenClaw Channel Gateway (OCG)
 
-A lightweight IM channel gateway that bridges OpenClaw's channel ecosystem to any OpenAI-compatible Agent API.
+A lightweight IM channel gateway that bridges OpenClaw's channel ecosystem to any OpenAI-compatible Agent API or ACP stdio agent.
 
 > [中文文档](README.zh-CN.md)
 
-OpenClaw has the richest IM channel ecosystem (Telegram, Discord, WeChat, DingTalk, QQ, and more), but its agent engine is built-in. OCG acts as a thin gateway layer — it reuses OpenClaw's channel plugins directly, forwards incoming messages via HTTP to any OpenAI-compatible Agent you configure (any LLM provider), and delivers the reply back to the IM channel.
+OpenClaw has the richest IM channel ecosystem (Telegram, Discord, WeChat, DingTalk, QQ, and more), but its agent engine is built-in. OCG acts as a thin gateway layer — it reuses OpenClaw's channel plugins directly, forwards incoming messages via HTTP to any OpenAI-compatible Agent you configure or via ACP to a local stdio agent, and delivers the reply back to the IM channel.
 
-> In one sentence: Let any OpenAI-compatible LLM provider benefit from OpenClaw's channel ecosystem.
+> In one sentence: Let any OpenAI-compatible LLM provider or ACP-capable coding agent benefit from OpenClaw's channel ecosystem.
 
 ---
 
@@ -31,11 +31,11 @@ OpenClaw has the richest IM channel ecosystem (Telegram, Discord, WeChat, DingTa
 │  │   Hook      │  │  Shims       │  │  Server     │  │
 │  └─────────────┘  └──────────────┘  └─────────────┘  │
 └──────────────────────┬───────────────────────────────┘
-                       │  HTTP (SSE streaming)
+                       │  HTTP (SSE streaming) or ACP stdio
                        ▼
 ┌──────────────────────────────────────────────────────┐
-│     Any OpenAI-compatible Agent API                   │
-│     (OpenAI / Ollama / vLLM / LiteLLM / ...)          │
+│     Any OpenAI-compatible Agent API / ACP Agent       │
+│     (OpenAI / Ollama / vLLM / LiteLLM / Core AI / ...)│
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -91,16 +91,21 @@ Create `ocg.json` (see `ocg.example.json` for reference):
   }
 }
 ```
-### Per-Channel agentUrl
+### Per-Channel Agent Transport
 
-Each channel can override the global `agentUrl` with its own endpoint. If a channel does not specify `agentUrl`, it falls back to the global `agentUrl`.
+OCG supports two agent transports:
+
+- `http` — OpenAI-compatible Chat Completions endpoint. HTTP mode can stream SSE blocks to IM channels.
+- `acp` — local ACP stdio agent subprocess. ACP mode keeps a long-running process and reuses sessions by IM conversation; by default it buffers streaming deltas and sends one final IM message.
+
+Each channel can override the global `agentType`, `agentUrl`, and `acp` settings. If a channel does not specify an override, it falls back to the global settings.
 
 **Priority** (highest to lowest):
 
-1. Channel-level `channels.<id>.agentUrl`
-2. Global `agentUrl`
-3. `OCG_AGENT_URL` env variable
-4. `http://127.0.0.1:11434/v1/chat/completions` (fallback)
+1. Channel-level `channels.<id>.agentType` / `agentUrl` / `acp`
+2. Global `agentType` / `agentUrl` / `acp`
+3. Environment variables such as `OCG_AGENT_URL`
+4. `http://127.0.0.1:11434/v1/chat/completions` (fallback HTTP URL)
 
 ```json
 {
@@ -119,13 +124,54 @@ Each channel can override the global `agentUrl` with its own endpoint. If a chan
 }
 ```
 
-In this example, `openclaw-weixin` uses the global endpoint while `qqbot` routes to its own `agentUrl`. Run `ocg status` to see each channel's effective agent URL in the output.
+In this example, `openclaw-weixin` uses the global endpoint while `qqbot` routes to its own `agentUrl`. Run `ocg status` to see each channel's effective agent URL and transport in the output.
 
-You can also configure via environment variables (env vars take precedence over global config, but per-channel `agentUrl` has the highest priority):
+#### ACP stdio agent
+
+Use `agentType: "acp"` to route messages to an ACP-capable local command instead of HTTP. This can be set globally or per channel:
+
+```json
+{
+  "agentType": "http",
+  "agentUrl": "http://127.0.0.1:11434/v1/chat/completions",
+  "channels": {
+    "openclaw-weixin": {
+      "accounts": { "default": { "enabled": true } }
+    },
+    "qqbot": {
+      "enabled": true,
+      "agentType": "acp",
+      "model": "core-ai-cli",
+      "acp": {
+        "command": "core-ai-cli",
+        "args": ["--acp-agent"],
+        "cwd": "D:/core-ai"
+      },
+      "appId": "YOUR_APP_ID",
+      "clientSecret": "YOUR_CLIENT_SECRET"
+    }
+  }
+}
+```
+
+ACP config keys:
+
+| Key | Description |
+|---|---|
+| `command` | ACP executable, for example `core-ai-cli`, `claude-agent-acp`, `codex-acp`, or `codex` |
+| `args` | Command arguments, for example `["--acp-agent"]` |
+| `cwd` | Working directory for the ACP subprocess and sessions |
+| `env` | Extra environment variables for the subprocess |
+| `timeoutMs` | Request timeout in milliseconds; default is 300000 |
+
+By default ACP streaming deltas are buffered and OCG sends a single final reply to the IM channel. Set `acpStreamBlocks: true` only if you explicitly want intermediate ACP chunks to be delivered as IM messages.
+
+You can also configure via environment variables (env vars take precedence over global config, but per-channel settings have the highest priority):
 
 | Env Variable | Description |
 |---|---|
 | `OCG_AGENT_URL` | Agent API endpoint |
+| `OCG_AGENT_TYPE` | Agent transport: `http` or `acp` |
 | `OCG_MODEL` | Model name |
 | `OCG_API_KEY` | API key |
 | `OCG_VERBOSE` | Verbose logging (`1` to enable) |
@@ -198,7 +244,7 @@ ocg plugins list
 
 ## Dispatch Modes
 
-### Synchronous Mode (default)
+### Synchronous HTTP Mode (default)
 
 Receive message → HTTP POST to Agent API → stream SSE response → deliver blocks to IM channel.
 
@@ -210,7 +256,20 @@ Receive message → HTTP POST to Agent API → stream SSE response → deliver b
         Text: Hello! How can I help you?
 ```
 
-### Async Mode (Fire & Forget)
+### ACP Mode
+
+Receive message → send prompt to the configured ACP stdio subprocess → buffer streaming deltas → deliver one final reply to IM channel.
+
+```
+📥 [IN]  From: qqbot:c2c:user  |  Session: agent:main:main
+       Body: Run the deployment check
+       → core-ai-cli @ acp://stdio
+📤 [OUT:ACP] 128 chars, 0 blocks
+```
+
+ACP mode currently uses synchronous request/response semantics from the IM channel perspective. It keeps the ACP process alive across messages and reuses the ACP session for the same IM conversation.
+
+### Async HTTP Mode (Fire & Forget)
 
 When the Agent Runtime needs to run long tasks (e.g., crawling, complex reasoning, multi-step tool calls), the synchronous HTTP connection may time out. Async mode solves this by decoupling request forwarding and reply delivery.
 
@@ -342,10 +401,10 @@ server.listen(8080);
 OCG achieves full compatibility with OpenClaw channel plugins through three interception layers:
 
 1. **Source-level interception (ESM Loader Hook)**
-   When plugin code imports `openclaw/plugin-sdk/*`, it is automatically redirected to OCG's shim modules. The shims preserve all real utility functions (routing, command detection, sessions, etc.) and only replace the dispatch function with HTTP forwarding.
+   When plugin code imports `openclaw/plugin-sdk/*`, it is automatically redirected to OCG's shim modules. The shims preserve all real utility functions (routing, command detection, sessions, etc.) and only replace the dispatch function with OCG's HTTP/ACP forwarding.
 
 2. **Chunk-level interception**
-   For pre-compiled OpenClaw chunks, the loader hook replaces the source entirely with OCG's HTTP dispatch implementation, so the built-in agent engine is never invoked.
+   For pre-compiled OpenClaw chunks, the loader hook replaces the source entirely with OCG's dispatch implementation, so the built-in agent engine is never invoked.
 
 3. **Plugin Runtime**
    OCG constructs a full `PluginRuntime` object (in-memory store, logger, reply pipeline, session, routing, commands, etc.). Channel plugins are completely unaware they're running in gateway mode.

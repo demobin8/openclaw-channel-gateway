@@ -329,6 +329,7 @@ export async function loadChannelPlugin(
             ctx: Record<string, unknown>,
           ) => Promise<unknown>,
           openclawVersion(),
+          candidate.id,
         );
 
         setChannelRuntimeFn(runtime);
@@ -367,6 +368,7 @@ export async function loadChannelPlugin(
               ctx: Record<string, unknown>,
             ) => Promise<unknown>,
             openclawVersion(),
+            candidate.id,
           );
           setRuntime(runtime);
           console.log(`[ocg] Injected runtime (legacy) for ${candidate.id}`);
@@ -535,10 +537,12 @@ export async function startChannel(
         ctx: Record<string, unknown>,
       ) => Promise<unknown>,
       openclawVersion(),
+      channelId,
     );
 
     const ctx: Record<string, unknown> = {
       cfg,
+      channelId,
       accountId,
       account,
       runtime,
