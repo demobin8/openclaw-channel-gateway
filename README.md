@@ -147,12 +147,17 @@ npm run cli -- start
 
 | Command | Description |
 |---|---|
-| `ocg start` | Start all enabled channels |
+| `ocg start` | Start all enabled channels in the foreground |
+| `ocg start --background` / `ocg start -d` | Start all enabled channels as a detached background process |
+| `ocg start --log-file [--log-dir <dir>]` | Write start logs to a file (default: `~/.openclaw-channel-gateway/ocg.logs/`) |
 | `ocg stop` | Stop all channels |
 | `ocg restart` | Restart all channels |
-| `ocg status` | Show gateway status |
+| `ocg status` | Show gateway status, including channels started by a background `ocg start` process |
 | `ocg test` | Run dispatch smoke test |
 | `ocg version` | Print version |
+| `ocg upgrade [--target <version>]` | Upgrade the OCG CLI package |
+
+Background start aliases: `--background`, `--bg`, `--daemon`, and `-d`. When background mode is used, OCG automatically writes logs to a start log file and prints the detached process PID plus the log path.
 
 ### Channel Management
 

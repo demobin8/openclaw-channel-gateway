@@ -50,8 +50,8 @@ import {
   channelLoginStart,
   channelLoginWait,
 } from "./plugin-loader.js";
-import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 function readPackageVersion(): string {
@@ -85,7 +85,7 @@ function printHelp(): void {
   console.log("Usage: ocg <command> [options]");
   console.log("");
   console.log("Commands:");
-  console.log("  start [--log-file] [--log-dir <dir>]  Start all enabled channels");
+  console.log("  start [--background|-d] [--log-file] [--log-dir <dir>]  Start all enabled channels");
   console.log("  stop                          Stop all channels");
   console.log("  restart                       Restart all channels");
   console.log("  status                        Show gateway status");
@@ -256,6 +256,15 @@ function resolveStartLogDir(args: Args): string {
   return join(resolveConfigDir(), "ocg.logs");
 }
 
+function shouldStartInBackground(args: Args): boolean {
+  return args["background"] === true || args["bg"] === true || args["daemon"] === true || args.d === true;
+}
+
+function createStartLogPath(logDir: string): string {
+  mkdirSync(logDir, { recursive: true });
+  return join(logDir, `ocg-start-${new Date().toISOString().replace(/[:.]/g, "-")}.log`);
+}
+
 function formatLogLine(level: "log" | "error" | "warn", values: unknown[]): string {
   const text = values.map((value) => {
     if (typeof value === "string") return value;
@@ -270,8 +279,7 @@ function formatLogLine(level: "log" | "error" | "warn", values: unknown[]): stri
 }
 
 async function runWithConsoleLogFile(logDir: string, fn: () => Promise<void>): Promise<void> {
-  mkdirSync(logDir, { recursive: true });
-  const logPath = join(logDir, `ocg-start-${new Date().toISOString().replace(/[:.]/g, "-")}.log`);
+  const logPath = createStartLogPath(logDir);
   const originalLog = console.log;
   const originalError = console.error;
   const originalWarn = console.warn;
@@ -321,7 +329,37 @@ async function runWithConsoleLogFile(logDir: string, fn: () => Promise<void>): P
   }
 }
 
+function buildBackgroundStartArgs(args: Args): string[] {
+  const childArgs = process.argv.slice(2).filter((arg) => !["--background", "--bg", "--daemon", "-d"].includes(arg));
+  if (!shouldWriteStartLogsToFile(args)) childArgs.push("--log-file");
+  return childArgs;
+}
+
+function startGatewayInBackground(args: Args): void {
+  const logPath = createStartLogPath(resolveStartLogDir(args));
+  const out = openSync(logPath, "a");
+  const err = openSync(logPath, "a");
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1], ...buildBackgroundStartArgs(args)], {
+    cwd: process.cwd(),
+    detached: true,
+    env: process.env,
+    stdio: ["ignore", out, err],
+  });
+
+  child.unref();
+  closeSync(out);
+  closeSync(err);
+
+  console.log(`[ocg] Started in background (pid: ${child.pid})`);
+  console.log(`[ocg] Logs: ${logPath}`);
+}
+
 async function cmdStart(args: Args = {}): Promise<void> {
+  if (shouldStartInBackground(args)) {
+    startGatewayInBackground(args);
+    return;
+  }
+
   if (shouldWriteStartLogsToFile(args)) {
     await runWithConsoleLogFile(resolveStartLogDir(args), startGateway);
     return;
@@ -386,11 +424,17 @@ async function cmdChannelsList(args: Args): Promise<void> {
 async function cmdChannelsStatus(args: Args): Promise<void> {
   const channelId = args["channel"] as string | undefined;
   if (channelId) {
-    const entry = getChannelStatus(channelId);
+    const s = gatewayStatus();
+    const entry = (s.channels as Array<Record<string, unknown>>).find((c) => c.id === channelId) ?? getChannelStatus(channelId);
     if (args["json"]) {
       console.log(JSON.stringify(entry ?? { status: "not-found" }, null, 2));
     } else if (entry) {
-      console.log(`${entry.channelId}: ${entry.status} (uptime: ${Math.round((Date.now() - entry.startedAt) / 1000)}s)`);
+      const statusEntry = entry as Record<string, unknown>;
+      const id = (statusEntry.channelId ?? statusEntry.id) as string;
+      const uptime = typeof statusEntry.uptime === "number"
+        ? statusEntry.uptime
+        : Math.round((Date.now() - ((statusEntry.startedAt as number | undefined) ?? Date.now())) / 1000);
+      console.log(`${id}: ${statusEntry.status} (uptime: ${uptime}s)`);
     } else {
       console.log(`${channelId}: not running`);
     }

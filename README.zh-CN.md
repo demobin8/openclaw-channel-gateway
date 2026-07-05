@@ -147,12 +147,17 @@ npm run cli -- start
 
 | 命令 | 说明 |
 |---|---|
-| `ocg start` | 启动所有已启用的渠道 |
+| `ocg start` | 前台启动所有已启用的渠道 |
+| `ocg start --background` / `ocg start -d` | 以 detached 后台进程启动所有已启用的渠道 |
+| `ocg start --log-file [--log-dir <dir>]` | 将启动日志写入文件（默认：`~/.openclaw-channel-gateway/ocg.logs/`） |
 | `ocg stop` | 停止所有渠道 |
 | `ocg restart` | 重启所有渠道 |
-| `ocg status` | 查看网关状态 |
+| `ocg status` | 查看网关状态，包括后台 `ocg start` 进程启动的渠道 |
 | `ocg test` | 运行 dispatch 冒烟测试 |
 | `ocg version` | 显示版本号 |
+| `ocg upgrade [--target <version>]` | 升级 OCG CLI 包 |
+
+后台启动别名：`--background`、`--bg`、`--daemon`、`-d`。使用后台模式时，OCG 会自动写入启动日志文件，并打印 detached 进程 PID 和日志路径。
 
 ### Channel 管理
 

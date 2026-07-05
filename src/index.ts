@@ -11,6 +11,12 @@
 import { loadConfig, resolveConfigPath, resolveConfigDir, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
 import { startAll, stopAll, listRunningChannels } from "./gateway.js";
 import { stopCallbackServer } from "./callback-server.js";
+import {
+  clearGatewayProcessState,
+  readActiveGatewayProcessState,
+  writeGatewayProcessState,
+  type PersistedAccountState,
+} from "./process-state.js";
 
 export {
   loadConfig,
@@ -46,6 +52,12 @@ export async function startGateway(): Promise<void> {
   if (channelIds.length === 0) throw new Error("No channels configured");
 
   const results = await startAll(cfg);
+  writeGatewayProcessState(cfg, results.map((r) => ({
+    channelId: r.channelId,
+    accountId: r.accountId,
+    status: "running",
+    startedAt: r.startedAt,
+  })));
   // startAll reports each account individually; dedupe by channel
   const uniqueChannelIds = new Set(results.map((r) => r.channelId));
   console.log(`[ocg] ${uniqueChannelIds.size} channel(s) running (${results.length} account(s))`);
@@ -54,10 +66,21 @@ export async function startGateway(): Promise<void> {
 export async function stopGateway(): Promise<void> {
   await stopAll();
   await stopCallbackServer();
+  clearGatewayProcessState();
 }
 
 export function gatewayStatus(): Record<string, unknown> {
-  const running = listRunningChannels();
+  const inProcessRunning = listRunningChannels();
+  const processState = inProcessRunning.length > 0 ? null : readActiveGatewayProcessState();
+  const running: PersistedAccountState[] = inProcessRunning.length > 0
+    ? inProcessRunning.map((entry) => ({
+      channelId: entry.channelId,
+      accountId: "default",
+      status: entry.status,
+      startedAt: entry.startedAt,
+      error: entry.error,
+    }))
+    : (processState?.accounts ?? []);
   const cfg = loadConfig();
   const configured = cfg?.channels ? Object.keys(cfg.channels) : [];
 
@@ -74,19 +97,21 @@ export function gatewayStatus(): Record<string, unknown> {
 
   return {
     configured: configured.length,
-    running: running.length,
+    running: new Set(running.map((b) => b.channelId)).size,
     channels: running.map((b) => {
       // Show per-channel agentUrl if set, otherwise fall back to global
-      const chAgentUrl = channelAgentUrls[b.channelId] || cfg?.agentUrl || process.env.OCG_AGENT_URL || "(not set)";
+      const chAgentUrl = channelAgentUrls[b.channelId] || cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)";
       return {
         id: b.channelId,
+        accountId: "accountId" in b ? b.accountId : undefined,
         status: b.status,
         uptime: b.startedAt ? Math.round((Date.now() - b.startedAt) / 1000) : 0,
         error: b.error,
         agentUrl: chAgentUrl,
       };
     }),
-    agentUrl: cfg?.agentUrl || process.env.OCG_AGENT_URL || "(not set)",
-    model: cfg?.model || process.env.OCG_MODEL || "(not set)",
+    pid: processState?.pid,
+    agentUrl: cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)",
+    model: cfg?.model || processState?.model || process.env.OCG_MODEL || "(not set)",
   };
 }
