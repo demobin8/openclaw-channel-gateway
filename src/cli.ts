@@ -7,6 +7,7 @@
  *   ocg restart                   重启全部
  *   ocg status                    网关状态
  *   ocg version                   版本
+ *   ocg upgrade                   升级 OCG CLI
  *
  *   ocg channels list [--json]    列出 channels
  *   ocg channels status [--channel <name>] [--json]
@@ -29,6 +30,7 @@ import {
   listConfiguredChannels,
   listAllChannels,
   resolveConfigPath,
+  resolveConfigDir,
   saveConfig,
 } from "./index.js";
 import { applyConfigEnvOverrides } from "./config.js";
@@ -48,7 +50,9 @@ import {
   channelLoginStart,
   channelLoginWait,
 } from "./plugin-loader.js";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 function readPackageVersion(): string {
   try {
@@ -81,12 +85,14 @@ function printHelp(): void {
   console.log("Usage: ocg <command> [options]");
   console.log("");
   console.log("Commands:");
-  console.log("  start                         Start all enabled channels");
+  console.log("  start [--log-file] [--log-dir <dir>]  Start all enabled channels");
   console.log("  stop                          Stop all channels");
   console.log("  restart                       Restart all channels");
   console.log("  status                        Show gateway status");
   console.log("  test                          Run dispatch smoke test");
   console.log("  version                       Print version");
+  console.log("  upgrade [--package-manager <pm>] [--target <version>] [--local] [--dry-run]");
+  console.log("                                Upgrade OCG CLI (default: npm global latest)");
   console.log("");
   console.log("  channels list [--all] [--json]  List channels");
   console.log("  channels status [--channel] [--json]  Show channel status");
@@ -114,6 +120,8 @@ function printHelp(): void {
 // ── Arg parser (simple positional + flags, no Commander dependency) ────────
 
 type Args = Record<string, string | boolean>;
+
+type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
 function parseArgs(raw: string[]): { command: string; args: Args } {
   const positional: string[] = [];
@@ -238,7 +246,87 @@ async function cmdTest(): Promise<void> {
   if (!allOk) process.exit(1);
 }
 
-async function cmdStart(): Promise<void> {
+function shouldWriteStartLogsToFile(args: Args): boolean {
+  return args["log-file"] === true || args["log"] === true || typeof args["log-dir"] === "string";
+}
+
+function resolveStartLogDir(args: Args): string {
+  const logDir = args["log-dir"];
+  if (typeof logDir === "string" && logDir.trim()) return resolve(logDir);
+  return join(resolveConfigDir(), "ocg.logs");
+}
+
+function formatLogLine(level: "log" | "error" | "warn", values: unknown[]): string {
+  const text = values.map((value) => {
+    if (typeof value === "string") return value;
+    if (value instanceof Error) return value.stack ?? value.message;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }).join(" ");
+  return `${new Date().toISOString()} [${level}] ${text}\n`;
+}
+
+async function runWithConsoleLogFile(logDir: string, fn: () => Promise<void>): Promise<void> {
+  mkdirSync(logDir, { recursive: true });
+  const logPath = join(logDir, `ocg-start-${new Date().toISOString().replace(/[:.]/g, "-")}.log`);
+  const originalLog = console.log;
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  const writeLog = (level: "log" | "error" | "warn", values: unknown[]) => {
+    appendFileSync(logPath, formatLogLine(level, values), "utf8");
+  };
+  const writeRaw = (chunk: string | Uint8Array, encoding?: BufferEncoding) => {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(encoding ?? "utf8");
+    appendFileSync(logPath, text, "utf8");
+  };
+  let caught: unknown;
+
+  console.log = (...values: unknown[]) => { writeLog("log", values); };
+  console.error = (...values: unknown[]) => { writeLog("error", values); };
+  console.warn = (...values: unknown[]) => { writeLog("warn", values); };
+  process.stdout.write = ((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((err?: Error) => void), callback?: (err?: Error) => void) => {
+    writeRaw(chunk, typeof encodingOrCallback === "string" ? encodingOrCallback : undefined);
+    const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+    if (cb) cb();
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((err?: Error) => void), callback?: (err?: Error) => void) => {
+    writeRaw(chunk, typeof encodingOrCallback === "string" ? encodingOrCallback : undefined);
+    const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+    if (cb) cb();
+    return true;
+  }) as typeof process.stderr.write;
+
+  originalLog(`[ocg] Writing start logs to ${logPath}`);
+
+  try {
+    await fn();
+  } catch (err) {
+    caught = err;
+    console.error("Error:", (err as Error).message);
+  }
+
+  if (caught) {
+    console.log = originalLog;
+    console.error = originalError;
+    console.warn = originalWarn;
+    process.stdout.write = originalStdoutWrite as typeof process.stdout.write;
+    process.stderr.write = originalStderrWrite as typeof process.stderr.write;
+    process.exit(1);
+  }
+}
+
+async function cmdStart(args: Args = {}): Promise<void> {
+  if (shouldWriteStartLogsToFile(args)) {
+    await runWithConsoleLogFile(resolveStartLogDir(args), startGateway);
+    return;
+  }
+
   try {
     await startGateway();
   } catch (err) {
@@ -521,6 +609,77 @@ async function cmdChannelsLogin(args: Args): Promise<void> {
   }
 }
 
+// ── Upgrade ──────────────────────────────────────────────────────────────
+
+function quoteShellArg(value: string): string {
+  return JSON.stringify(value);
+}
+
+function resolveExecutable(command: string): string {
+  if (process.platform !== "win32") return command;
+  if (command === "npm" || command === "pnpm" || command === "yarn") return `${command}.cmd`;
+  return command;
+}
+
+function runPackageManagerCommand(command: string, args: string[], cwd: string): void {
+  execFileSync(resolveExecutable(command), args, { cwd, stdio: "inherit" });
+}
+
+function resolvePackageManager(args: Args): PackageManager {
+  const raw = (args["package-manager"] ?? args["pm"]) as string | boolean | undefined;
+  if (!raw || raw === true) return "npm";
+  if (["npm", "pnpm", "yarn", "bun"].includes(raw)) return raw as PackageManager;
+  console.error(`Unsupported package manager: ${raw}`);
+  console.error("Supported package managers: npm, pnpm, yarn, bun");
+  process.exit(1);
+}
+
+function buildUpgradeCommand(pm: PackageManager, target: string, global: boolean): { command: string; args: string[] } {
+  if (global) {
+    switch (pm) {
+      case "npm": return { command: "npm", args: ["install", "-g", `openclaw-channel-gateway@${target}`] };
+      case "pnpm": return { command: "pnpm", args: ["add", "-g", `openclaw-channel-gateway@${target}`] };
+      case "yarn": return { command: "yarn", args: ["global", "add", `openclaw-channel-gateway@${target}`] };
+      case "bun": return { command: "bun", args: ["add", "-g", `openclaw-channel-gateway@${target}`] };
+    }
+  }
+
+  switch (pm) {
+    case "npm": return { command: "npm", args: ["install", `openclaw-channel-gateway@${target}`] };
+    case "pnpm": return { command: "pnpm", args: ["add", `openclaw-channel-gateway@${target}`] };
+    case "yarn": return { command: "yarn", args: ["add", `openclaw-channel-gateway@${target}`] };
+    case "bun": return { command: "bun", args: ["add", `openclaw-channel-gateway@${target}`] };
+  }
+}
+
+async function cmdUpgrade(args: Args): Promise<void> {
+  const pm = resolvePackageManager(args);
+  const target = resolveUpgradeTarget(args);
+  const global = args["global"] === true || args["g"] === true || args["local"] !== true;
+  const dryRun = args["dry-run"] === true;
+  const upgrade = buildUpgradeCommand(pm, target, global);
+  const printable = [upgrade.command, ...upgrade.args.map(quoteShellArg)].join(" ");
+
+  console.log(`[ocg] Current version: ${VERSION}`);
+  console.log(`[ocg] Upgrade command: ${printable}`);
+  if (dryRun) return;
+
+  try {
+    runPackageManagerCommand(upgrade.command, upgrade.args, process.cwd());
+    console.log(`[ocg] Upgrade complete. Restart your shell if the old ocg is still cached.`);
+  } catch (err) {
+    console.error(`[ocg] Upgrade failed: ${(err as Error).message}`);
+    console.error(`[ocg] You can run it manually: ${printable}`);
+    process.exit(1);
+  }
+}
+
+function resolveUpgradeTarget(args: Args): string {
+  if (typeof args["target"] === "string") return args["target"];
+  if (typeof args["to"] === "string") return args["to"];
+  return "latest";
+}
+
 // ── Plugins ──────────────────────────────────────────────────────────────
 
 async function cmdPluginsInstall(pkg: string): Promise<void> {
@@ -708,7 +867,7 @@ async function run(): Promise<void> {
 
   // Top-level commands
   if (!command || command === "help") return printHelp();
-  if (command === "start") return cmdStart();
+  if (command === "start") return cmdStart(args);
   if (command === "version") { console.log(`ocg v${VERSION}`); return; }
 
   switch (command) {
@@ -716,6 +875,7 @@ async function run(): Promise<void> {
     case "restart": return cmdRestart();
     case "status": return cmdStatus(args);
     case "test": return cmdTest();
+    case "upgrade": return cmdUpgrade(args);
   }
 
   // plugins subcommands
