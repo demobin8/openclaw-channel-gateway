@@ -10,38 +10,9 @@ OpenClaw has the richest IM channel ecosystem (Telegram, Discord, WeChat, DingTa
 
 ---
 
-## Architecture
+## Supported Channels
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Telegram    │    │   WeChat     │    │   DingTalk   │   ...
-└──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-       │                   │                   │
-       ▼                   ▼                   ▼
-┌──────────────────────────────────────────────────────┐
-│              OpenClaw Channel Plugins                 │
-│    (reused natively — no code porting needed)         │
-└──────────────────────┬───────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│                    OCG Gateway                        │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  │
-│  │ ESM Loader  │  │  Dispatch    │  │  Callback   │  │
-│  │   Hook      │  │  Shims       │  │  Server     │  │
-│  └─────────────┘  └──────────────┘  └─────────────┘  │
-└──────────────────────┬───────────────────────────────┘
-                       │  HTTP (SSE streaming) or ACP stdio
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│     Any OpenAI-compatible Agent API / ACP Agent       │
-│     (OpenAI / Ollama / vLLM / LiteLLM / Core AI / ...)│
-└──────────────────────────────────────────────────────┘
-```
-
-## IM Channels
-
-OCG supports all OpenClaw ecosystem IM channel plugins by default. Any npm package with `"openclaw.channel"` metadata can be installed as a plugin:
+OCG supports **all** OpenClaw ecosystem IM channel plugins out of the box. Any npm package with `"openclaw.channel"` metadata works as a plugin:
 
 ```bash
 ocg plugins install <plugin-package>
@@ -56,6 +27,8 @@ The following channels have been tested and verified:
 | WeChat | `@tencent-weixin/openclaw-weixin` | External |
 | DingTalk | `@dingtalk-real-ai/dingtalk-connector` | External |
 | QQ | `@openclaw/qqbot` | External |
+
+---
 
 ## Quick Start
 
@@ -91,6 +64,7 @@ Create `ocg.json` (see `ocg.example.json` for reference):
   }
 }
 ```
+
 ### Per-Channel Agent Transport
 
 OCG supports two agent transports:
@@ -124,8 +98,6 @@ Each channel can override the global `agentType`, `agentUrl`, and `acp` settings
 }
 ```
 
-In this example, `openclaw-weixin` uses the global endpoint while `qqbot` routes to its own `agentUrl`. Run `ocg status` to see each channel's effective agent URL and transport in the output.
-
 #### ACP stdio agent
 
 Use `agentType: "acp"` to route messages to an ACP-capable local command instead of HTTP. This can be set globally or per channel:
@@ -154,19 +126,17 @@ Use `agentType: "acp"` to route messages to an ACP-capable local command instead
 }
 ```
 
-ACP config keys:
-
-| Key | Description |
+| ACP key | Description |
 |---|---|
-| `command` | ACP executable, for example `core-ai-cli`, `claude-agent-acp`, `codex-acp`, or `codex` |
-| `args` | Command arguments, for example `["--acp-agent"]` |
+| `command` | ACP executable, e.g. `core-ai-cli`, `claude-agent-acp`, `codex-acp`, or `codex` |
+| `args` | Command arguments, e.g. `["--acp-agent"]` |
 | `cwd` | Working directory for the ACP subprocess and sessions |
 | `env` | Extra environment variables for the subprocess |
-| `timeoutMs` | Request timeout in milliseconds; default is 300000 |
+| `timeoutMs` | Request timeout in milliseconds; default `300000` |
 
-By default ACP streaming deltas are buffered and OCG sends a single final reply to the IM channel. Set `acpStreamBlocks: true` only if you explicitly want intermediate ACP chunks to be delivered as IM messages.
+By default ACP streaming deltas are buffered and OCG sends a single final reply to the IM channel. Set `acpStreamBlocks: true` only if you want intermediate ACP chunks delivered as IM messages.
 
-You can also configure via environment variables (env vars take precedence over global config, but per-channel settings have the highest priority):
+You can also configure via environment variables:
 
 | Env Variable | Description |
 |---|---|
@@ -180,12 +150,12 @@ You can also configure via environment variables (env vars take precedence over 
 ### Launch
 
 ```bash
-# Start all configured channels
 ocg start
-
-# Or use npm directly
-npm run cli -- start
 ```
+
+That's it — OCG will start all enabled channels and begin forwarding messages to your agent.
+
+---
 
 ## CLI Commands
 
@@ -198,12 +168,12 @@ npm run cli -- start
 | `ocg start --log-file [--log-dir <dir>]` | Write start logs to a file (default: `~/.openclaw-channel-gateway/ocg.logs/`) |
 | `ocg stop` | Stop all channels |
 | `ocg restart` | Restart all channels |
-| `ocg status` | Show gateway status, including channels started by a background `ocg start` process |
+| `ocg status` | Show gateway status, including background-started channels |
 | `ocg test` | Run dispatch smoke test |
 | `ocg version` | Print version |
 | `ocg upgrade [--target <version>]` | Upgrade the OCG CLI package |
 
-Background start aliases: `--background`, `--bg`, `--daemon`, and `-d`. When background mode is used, OCG automatically writes logs to a start log file and prints the detached process PID plus the log path.
+Background start aliases: `--background`, `--bg`, `--daemon`, and `-d`. In background mode, OCG automatically writes logs and prints the detached PID plus the log path.
 
 ### Channel Management
 
@@ -214,7 +184,7 @@ ocg channels list [--all] [--json]
 # Channel status
 ocg channels status [--channel <id>] [--json]
 
-# Start / stop / restart a channel
+# Start / stop / restart a specific channel
 ocg channels start --channel telegram
 ocg channels stop --channel telegram
 ocg channels restart --channel telegram
@@ -242,172 +212,68 @@ ocg plugins install @openclaw/qqbot
 ocg plugins list
 ```
 
+---
+
 ## Dispatch Modes
 
 ### Synchronous HTTP Mode (default)
 
-Receive message → HTTP POST to Agent API → stream SSE response → deliver blocks to IM channel.
+Receive message → Forward to Agent API → Stream response back → Deliver to IM channel.
 
-```
-📥 [IN]  From: telegram:12345  |  Session: telegram:default:12345
-        Body: Hello
-        → gpt-4o @ http://127.0.0.1:11434/v1/chat/completions
-📤 [OUT] 42 chars, 4 blocks
-        Text: Hello! How can I help you?
-```
+This is the default mode and works well for most use cases.
 
 ### ACP Mode
 
 Receive message → send prompt to the configured ACP stdio subprocess → buffer streaming deltas → deliver one final reply to IM channel.
 
-```
-📥 [IN]  From: qqbot:c2c:user  |  Session: agent:main:main
-       Body: Run the deployment check
-       → core-ai-cli @ acp://stdio
-📤 [OUT:ACP] 128 chars, 0 blocks
-```
+ACP mode uses synchronous request/response semantics from the IM perspective. OCG keeps the ACP process alive across messages and reuses the ACP session for the same IM conversation.
 
-ACP mode currently uses synchronous request/response semantics from the IM channel perspective. It keeps the ACP process alive across messages and reuses the ACP session for the same IM conversation.
+### Async HTTP Mode
 
-### Async HTTP Mode (Fire & Forget)
+When your agent needs to run long tasks (crawling, complex reasoning, multi-step tool calls), the synchronous HTTP connection may time out. Async mode decouples request forwarding from reply delivery — OCG forwards the message and returns immediately, then your agent calls back when done.
 
-When the Agent Runtime needs to run long tasks (e.g., crawling, complex reasoning, multi-step tool calls), the synchronous HTTP connection may time out. Async mode solves this by decoupling request forwarding and reply delivery.
-
-**How it works:**
-
-```
-IM → OCG ──POST (fast)──→ Agent Runtime
-                              │
-                              ├─ 1. Parse incoming message
-                              ├─ 2. Run long task (minutes~hours)
-                              └─ 3. POST /ocg/callback/{token} → OCG → IM
-```
-
-OCG forwards the message (clean OpenAI format) and returns immediately. No HTTP connection is held open. When the Agent finishes, it calls the callback URL to deliver the reply.
-
-**Configuration** (`ocg.json`):
+Enable async mode in `ocg.json`:
 
 ```json
 {
   "async": true,
   "callbackPort": 3457,
   "callbackHost": "0.0.0.0",
-  "callbackSecret": "(optional)",
+  "callbackSecret": "(optional shared secret)",
   "callbackTokenTTL": 1800
 }
 ```
 
 | Config key | Default | Description |
 |---|---|---|
-| `async` | `false` | Enable async dispatch mode |
-| `callbackPort` | `3457` | Port for the built-in callback HTTP server |
-| `callbackHost` | `0.0.0.0` | Bind address (all interfaces). The `X-OCG-Callback` URL auto-rewrites `0.0.0.0` → `127.0.0.1` |
-| `callbackSecret` | — | Shared secret for HMAC-SHA256 signature verification |
-| `callbackTokenTTL` | `1800` | Callback token lifetime in seconds (default 30 minutes) |
+| `async` | `false` | Enable async dispatch |
+| `callbackPort` | `3457` | Callback HTTP server port |
+| `callbackHost` | `0.0.0.0` | Bind address |
+| `callbackSecret` | — | Optional HMAC-SHA256 shared secret for signing callbacks |
+| `callbackTokenTTL` | `1800` | Token lifetime in seconds (default 30 min) |
 
-**Protocol — Forward request** (OCG → Agent):
+**How it works:**
 
-OCG sends a **standard OpenAI chat completion request** with the callback URL in an HTTP header. The request body contains no custom fields — any OpenAI-compatible API can receive it unchanged.
+OCG sends a standard OpenAI chat completion request with a callback URL in the `X-OCG-Callback` header. Your agent processes the message (even for minutes or hours), then POSTs the reply to that callback URL.
 
-```http
-POST /v1/chat/completions
-Content-Type: application/json
-X-OCG-Callback: http://127.0.0.1:3457/ocg/callback/a1b2c3d4...
-Authorization: Bearer sk-xxx
+**Callback request format** (Agent → OCG):
 
+```json
 {
-  "model": "gpt-4o",
-  "messages": [{ "role": "user", "content": "Hello" }],
-  "stream": false
-}
-```
-
-| Header | Description |
-|---|---|
-| `X-OCG-Callback` | Callback URL the Agent must POST to when done. Includes a 64-hex-char random token in the path. |
-
-**Protocol — Callback request** (Agent → OCG):
-
-When the Agent finishes processing, it sends the reply to the callback URL from the `X-OCG-Callback` header.
-
-```http
-POST /ocg/callback/a1b2c3d4...
-Content-Type: application/json
-X-OCG-Signature: sha256=<hex-digest>
-
-{
-  "reply": "Reply content",
+  "reply": "Your reply text here",
   "isError": false
 }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `reply` | string \| object | Yes | Reply text (`string`) or structured content (`{ text, content, ... }`) |
-| `isError` | boolean | No | If `true`, OCG delivers as an error message (default `false`) |
-
-**HMAC Signature** (optional):
-
-When `callbackSecret` is configured, the Agent must sign each callback request:
+If `callbackSecret` is configured, include an HMAC-SHA256 signature in the `X-OCG-Signature` header:
 
 ```
-signature = HMAC-SHA256(request-body-bytes, callbackSecret)
-header    = "sha256=" + hex(signature)
+X-OCG-Signature: sha256=<hex-digest>
 ```
 
-OCG rejects callbacks with missing or incorrect signatures (HTTP 401).
+Each callback token is single-use and expires after `callbackTokenTTL` seconds.
 
-**Token lifecycle:**
-
-- Each forwarded message gets a unique 64-hex-char token (backed by `crypto.randomBytes`).
-- The token is valid for **30 minutes** by default (configurable via `callbackTokenTTL` in seconds). If the Agent takes longer, it must re-send (the original message will still be delivered to the Agent, and the callback will get a new token).
-- Each token is **single-use** — consumed on first successful callback.
-
-**Example Agent Runtime (Node.js)**:
-
-```js
-import http from "node:http";
-
-const server = http.createServer(async (req, res) => {
-  // 1. Read the forward request
-  const body = await readBody(req);
-  const callbackUrl = req.headers["x-ocg-callback"];
-  if (!callbackUrl) {
-    res.writeHead(400); res.end("missing X-OCG-Callback"); return;
-  }
-
-  // 2. Respond immediately — OCG doesn't wait
-  res.writeHead(202, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "accepted" }));
-
-  // 3. Do the actual work
-  const msg = JSON.parse(body).messages[0].content;
-  const reply = await yourAgent.process(msg); // may take minutes
-
-  // 4. Call back OCG with the result
-  await fetch(callbackUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reply }),
-  });
-});
-server.listen(8080);
-```
-
-> **Tip**: The above example shows a minimal Agent Runtime. For HMAC signing, compute `HMAC-SHA256(responseBody, secret)` and add the `X-OCG-Signature` header.
-
-## How It Stays Compatible with OpenClaw
-
-OCG achieves full compatibility with OpenClaw channel plugins through three interception layers:
-
-1. **Source-level interception (ESM Loader Hook)**
-   When plugin code imports `openclaw/plugin-sdk/*`, it is automatically redirected to OCG's shim modules. The shims preserve all real utility functions (routing, command detection, sessions, etc.) and only replace the dispatch function with OCG's HTTP/ACP forwarding.
-
-2. **Chunk-level interception**
-   For pre-compiled OpenClaw chunks, the loader hook replaces the source entirely with OCG's dispatch implementation, so the built-in agent engine is never invoked.
-
-3. **Plugin Runtime**
-   OCG constructs a full `PluginRuntime` object (in-memory store, logger, reply pipeline, session, routing, commands, etc.). Channel plugins are completely unaware they're running in gateway mode.
+---
 
 ## Development
 
@@ -421,32 +287,3 @@ npm run build
 # Production run
 npm start
 ```
-
-### Project Structure
-
-```
-openclaw-channel-gateway/
-├── bin/
-│   └── ocg.cjs                  # CLI entry point (CJS bootstrap)
-├── src/
-│   ├── index.ts                 # Main module entry
-│   ├── cli.ts                   # CLI command parsing & handling
-│   ├── config.ts                # Config load/write (ocg.json)
-│   ├── gateway.ts               # Channel lifecycle management
-│   ├── plugin-loader.ts         # Plugin discovery & loading
-│   ├── loader.ts                # ESM Loader Hook
-│   ├── callback-server.ts       # Async callback HTTP server
-│   ├── auth/
-│   │   └── dingtalk-login.ts    # DingTalk device auth flow
-│   └── shims/
-│       ├── reply-dispatch-runtime.ts  # HTTP dispatch replacement
-│       ├── runtime.ts                 # PluginRuntime factory
-│       ├── runtime-env.ts
-│       ├── runtime-config-snapshot.ts
-│       └── session-store-runtime.ts
-├── dist/                        # Build output
-├── ocg.example.json             # Config example
-├── tsconfig.json
-└── package.json
-```
-

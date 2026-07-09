@@ -10,38 +10,9 @@ OpenClaw 拥有最丰富的 IM 渠道生态（Telegram、Discord、微信、钉�
 
 ---
 
-## 架构
+## 支持渠道
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Telegram    │    │   WeChat     │    │   DingTalk   │   ...
-└──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-       │                   │                   │
-       ▼                   ▼                   ▼
-┌──────────────────────────────────────────────────────┐
-│              OpenClaw Channel Plugins                 │
-│           (原生复用, 无需代码移植)                        │
-└──────────────────────┬───────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│                    OCG Gateway                        │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  │
-│  │ ESM Loader  │  │  Dispatch    │  │  Callback   │  │
-│  │   Hook      │  │  Shims       │  │  Server     │  │
-│  └─────────────┘  └──────────────┘  └─────────────┘  │
-└──────────────────────┬───────────────────────────────┘
-                       │  HTTP (SSE streaming) 或 ACP stdio
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│     任何 OpenAI 兼容 Agent API / ACP Agent              │
-│     (OpenAI / Ollama / vLLM / LiteLLM / Core AI / ...)│
-└──────────────────────────────────────────────────────┘
-```
-
-## IM 渠道
-
-OCG 默认支持所有 OpenClaw 生态的 IM Channel 插件。任何带有 `"openclaw.channel"` 元数据的 npm 包都可以作为插件安装：
+OCG **原生支持** OpenClaw 生态的所有 IM Channel 插件。任何带有 `"openclaw.channel"` 元数据的 npm 包都可以作为插件安装：
 
 ```bash
 ocg plugins install <插件包名>
@@ -56,6 +27,8 @@ ocg plugins install <插件包名>
 | 微信 | `@tencent-weixin/openclaw-weixin` | 外部 |
 | 钉钉 | `@dingtalk-real-ai/dingtalk-connector` | 外部 |
 | QQ | `@openclaw/qqbot` | 外部 |
+
+---
 
 ## 快速开始
 
@@ -84,13 +57,14 @@ npm install -g openclaw-channel-gateway
       "accounts": {
         "default": {
           "enabled": true,
-          "botToken": "YOUR_BOT_TOKEN_HERE"
+          "botToken": "你的 Bot Token"
         }
       }
     }
   }
 }
 ```
+
 ### 渠道级 Agent 传输方式
 
 OCG 支持两种 Agent 传输方式：
@@ -102,7 +76,7 @@ OCG 支持两种 Agent 传输方式：
 
 **优先级**（从高到低）：
 
-1. 渠道级别 `channels.<id>.agentType` / `agentUrl` / `acp`
+1. 渠道级 `channels.<id>.agentType` / `agentUrl` / `acp`
 2. 全局 `agentType` / `agentUrl` / `acp`
 3. 环境变量，例如 `OCG_AGENT_URL`
 4. `http://127.0.0.1:11434/v1/chat/completions`（HTTP URL 兜底）
@@ -117,14 +91,12 @@ OCG 支持两种 Agent 传输方式：
     "qqbot": {
       "enabled": true,
       "agentUrl": "http://10.0.0.5:8080/v1/chat/completions",
-      "appId": "YOUR_APP_ID",
-      "clientSecret": "YOUR_CLIENT_SECRET"
+      "appId": "你的 App ID",
+      "clientSecret": "你的 Client Secret"
     }
   }
 }
 ```
-
-以上示例中，`openclaw-weixin` 使用全局端点，而 `qqbot` 走自己的 `agentUrl`。运行 `ocg status` 可在输出中看到每个渠道实际使用的 Agent URL 和传输方式。
 
 #### ACP stdio Agent
 
@@ -147,26 +119,24 @@ OCG 支持两种 Agent 传输方式：
         "args": ["--acp-agent"],
         "cwd": "D:/core-ai"
       },
-      "appId": "YOUR_APP_ID",
-      "clientSecret": "YOUR_CLIENT_SECRET"
+      "appId": "你的 App ID",
+      "clientSecret": "你的 Client Secret"
     }
   }
 }
 ```
 
-ACP 配置项：
-
-| 配置项 | 说明 |
+| ACP 配置项 | 说明 |
 |---|---|
 | `command` | ACP 可执行命令，例如 `core-ai-cli`、`claude-agent-acp`、`codex-acp` 或 `codex` |
 | `args` | 命令参数，例如 `["--acp-agent"]` |
 | `cwd` | ACP 子进程和 session 使用的工作目录 |
 | `env` | 传给子进程的额外环境变量 |
-| `timeoutMs` | 请求超时时间，单位毫秒；默认 300000 |
+| `timeoutMs` | 请求超时时间，单位毫秒；默认 `300000` |
 
 ACP 模式默认会缓冲流式 delta，并只向 IM 渠道发送一条最终回复。仅当你明确希望把 ACP 中间块作为 IM 消息发送时，才设置 `acpStreamBlocks: true`。
 
-也可以通过环境变量配置（环境变量优先级高于全局配置，但低于渠道级配置）：
+也可以通过环境变量配置：
 
 | 环境变量 | 说明 |
 |---|---|
@@ -174,18 +144,18 @@ ACP 模式默认会缓冲流式 delta，并只向 IM 渠道发送一条最终回
 | `OCG_AGENT_TYPE` | Agent 传输方式：`http` 或 `acp` |
 | `OCG_MODEL` | 模型名称 |
 | `OCG_API_KEY` | API Key |
-| `OCG_VERBOSE` | 详细日志 (`1` 启用) |
+| `OCG_VERBOSE` | 详细日志（`1` 启用） |
 | `OCG_CONFIG_PATH` | 配置文件路径 |
 
 ### 启动
 
 ```bash
-# 启动所有已配置的渠道
 ocg start
-
-# 或者直接使用 npm
-npm run cli -- start
 ```
+
+搞定 — OCG 会启动所有已启用的渠道，开始将消息转发给你的 Agent。
+
+---
 
 ## CLI 命令
 
@@ -198,12 +168,12 @@ npm run cli -- start
 | `ocg start --log-file [--log-dir <dir>]` | 将启动日志写入文件（默认：`~/.openclaw-channel-gateway/ocg.logs/`） |
 | `ocg stop` | 停止所有渠道 |
 | `ocg restart` | 重启所有渠道 |
-| `ocg status` | 查看网关状态，包括后台 `ocg start` 进程启动的渠道 |
+| `ocg status` | 查看网关状态，包括后台启动的渠道 |
 | `ocg test` | 运行 dispatch 冒烟测试 |
 | `ocg version` | 显示版本号 |
 | `ocg upgrade [--target <version>]` | 升级 OCG CLI 包 |
 
-后台启动别名：`--background`、`--bg`、`--daemon`、`-d`。使用后台模式时，OCG 会自动写入启动日志文件，并打印 detached 进程 PID 和日志路径。
+后台启动别名：`--background`、`--bg`、`--daemon`、`-d`。使用后台模式时，OCG 会自动写入日志文件，并打印 detached 进程 PID 和日志路径。
 
 ### Channel 管理
 
@@ -214,7 +184,7 @@ ocg channels list [--all] [--json]
 # 渠道状态
 ocg channels status [--channel <id>] [--json]
 
-# 启动/停止/重启指定渠道
+# 启动 / 停止 / 重启指定渠道
 ocg channels start --channel telegram
 ocg channels stop --channel telegram
 ocg channels restart --channel telegram
@@ -227,7 +197,7 @@ ocg channels add --channel discord --token "..." --account ops
 # 移除渠道
 ocg channels remove --channel telegram
 
-# QR 扫码登录 (微信、钉钉等)
+# QR 扫码登录（微信、钉钉等）
 ocg channels login --channel openclaw-weixin
 ocg channels login --channel dingtalk-connector
 ```
@@ -238,61 +208,38 @@ ocg channels login --channel dingtalk-connector
 # 安装外部插件
 ocg plugins install @openclaw/qqbot
 
-# 列出已安装的插件
+# 列出已安装插件
 ocg plugins list
 ```
+
+---
 
 ## 调度模式
 
 ### 同步 HTTP 模式（默认）
 
-收到消息 → HTTP POST 到 Agent API → 流式接收 SSE 响应 → 逐块投递到 IM 渠道。
+收到消息 → 转发到 Agent API → 流式接收响应 → 投递到 IM 渠道。
 
-```
-📥 [IN]  From: telegram:12345  |  Session: telegram:default:12345
-        Body: 你好
-        → gpt-4o @ http://127.0.0.1:11434/v1/chat/completions
-📤 [OUT] 42 chars, 4 blocks
-        Text: 你好！有什么可以帮助你的吗？
-```
+默认模式，满足大多数使用场景。
 
 ### ACP 模式
 
 收到消息 → 发送 prompt 到配置的 ACP stdio 子进程 → 缓冲流式 delta → 向 IM 渠道投递一条最终回复。
 
-```
-📥 [IN]  From: qqbot:c2c:user  |  Session: agent:main:main
-       Body: 执行部署检查
-       → core-ai-cli @ acp://stdio
-📤 [OUT:ACP] 128 chars, 0 blocks
-```
-
 ACP 模式从 IM 渠道视角看是同步请求/响应。OCG 会在多条消息之间保持 ACP 进程存活，并为同一个 IM 会话复用 ACP session。
 
-### 异步 HTTP 模式（Fire & Forget）
+### 异步 HTTP 模式
 
-当 Agent Runtime 需要执行耗时任务（如爬虫、复杂推理、多步工具调用）时，同步 HTTP 连接可能超时。异步模式通过解耦请求转发和回复投递来解决这个问题。
+当 Agent 需要执行耗时任务（如爬虫、复杂推理、多步工具调用）时，同步 HTTP 连接可能超时。异步模式将请求转发与回复投递解耦 — OCG 转发消息后立即返回，Agent 完成后主动回调投递结果。
 
-**工作流程：**
-
-```
-IM → OCG ──POST（快速返回）──→ Agent Runtime
-                                  │
-                                  ├─ 1. 解析消息
-                                  ├─ 2. 执行耗时任务（分钟~小时）
-                                  └─ 3. POST /ocg/callback/{token} → OCG → IM
-```
-
-OCG 以**纯 OpenAI 格式**转发消息后立即返回，不保持 HTTP 长连接。Agent 完成任务后，主动回调 OCG 投递结果。
-
-**配置**（`ocg.json`）：
+在 `ocg.json` 中启用：
 
 ```json
 {
   "async": true,
   "callbackPort": 3457,
   "callbackHost": "0.0.0.0",
-  "callbackSecret": "（可选）",
+  "callbackSecret": "（可选共享密钥）",
   "callbackTokenTTL": 1800
 }
 ```
@@ -300,119 +247,38 @@ OCG 以**纯 OpenAI 格式**转发消息后立即返回，不保持 HTTP 长连�
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `async` | `false` | 启用异步调度 |
-| `callbackPort` | `3457` | OCG 内置回调 HTTP 服务端口 |
-| `callbackHost` | `0.0.0.0` | 绑定地址（所有网络接口）。`X-OCG-Callback` URL 中 `0.0.0.0` 自动改写为 `127.0.0.1` |
-| `callbackSecret` | — | HMAC-SHA256 签名共享密钥（可选） |
+| `callbackPort` | `3457` | 回调 HTTP 服务端口 |
+| `callbackHost` | `0.0.0.0` | 绑定地址 |
+| `callbackSecret` | — | 可选，HMAC-SHA256 签名共享密钥 |
 | `callbackTokenTTL` | `1800` | Token 有效期（秒，默认 30 分钟） |
 
-**协议 — 转发请求**（OCG → Agent）：
+**工作方式：**
 
-OCG 发送**标准 OpenAI 格式**的请求，回调地址放在 HTTP Header 中。请求体不含任何自定义字段，任意兼容 OpenAI API 的服务均可直接接收。
+OCG 发送标准 OpenAI 格式请求，在 `X-OCG-Callback` 头中携带回调地址。你的 Agent 处理消息（即使耗时数分钟到数小时），完成后向该回调地址 POST 回复。
 
-```http
-POST /v1/chat/completions
-Content-Type: application/json
-X-OCG-Callback: http://127.0.0.1:3457/ocg/callback/a1b2c3d4...
-Authorization: Bearer sk-xxx
+**回调请求格式**（Agent → OCG）：
 
+```json
 {
-  "model": "gpt-4o",
-  "messages": [{ "role": "user", "content": "你好" }],
-  "stream": false
-}
-```
-
-| Header | 说明 |
-|---|---|
-| `X-OCG-Callback` | Agent 完成后必须 POST 的回调地址，路径中包含 64 位十六进制随机 token |
-
-**协议 — 回调请求**（Agent → OCG）：
-
-Agent 处理完毕后，向 `X-OCG-Callback` 中的 URL 发送回复。
-
-```http
-POST /ocg/callback/a1b2c3d4...
-Content-Type: application/json
-X-OCG-Signature: sha256=<hex-digest>
-
-{
-  "reply": "回复内容",
+  "reply": "你的回复内容",
   "isError": false
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `reply` | string \| object | 是 | 回复文本（string）或结构化内容（`{ text, content, ... }`） |
-| `isError` | boolean | 否 | 是否作为错误消息投递（默认 `false`） |
-
-**HMAC 签名**（可选）：
-
-当配置了 `callbackSecret` 时，Agent 需对每次回调请求签名：
+如果配置了 `callbackSecret`，需在 `X-OCG-Signature` 头中附带 HMAC-SHA256 签名：
 
 ```
-signature = HMAC-SHA256(请求体原始字节, callbackSecret)
-header    = "sha256=" + hex(signature)
+X-OCG-Signature: sha256=<hex-digest>
 ```
 
-OCG 会拒绝签名缺失或错误的回调（HTTP 401）。
+每个回调 token 一次性消费，`callbackTokenTTL` 秒后过期。
 
-**Token 生命周期：**
-
-- 每条转发消息生成一个唯一 64 位十六进制 token（基于 `crypto.randomBytes`）。
-- Token 默认有效期为 **30 分钟**（可通过 `callbackTokenTTL` 秒数配置）。超时后需重新发起请求，新的转发会产生新 token。
-- 每个 token **一次性消费**——成功回调后立即销毁，防止重放。
-
-**Agent Runtime 示例（Node.js）：**
-
-```js
-import http from "node:http";
-
-const server = http.createServer(async (req, res) => {
-  // 1. 读取转发请求
-  const body = await readBody(req);
-  const callbackUrl = req.headers["x-ocg-callback"];
-  if (!callbackUrl) {
-    res.writeHead(400); res.end("缺少 X-OCG-Callback"); return;
-  }
-
-  // 2. 立即返回 202 — OCG 不等待
-  res.writeHead(202, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "accepted" }));
-
-  // 3. 执行实际任务
-  const msg = JSON.parse(body).messages[0].content;
-  const reply = await yourAgent.process(msg); // 可能耗时数分钟
-
-  // 4. 回调 OCG 投递结果
-  await fetch(callbackUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reply }),
-  });
-});
-server.listen(8080);
-```
-
-> **提示**：以上展示最小可用的 Agent Runtime。若需 HMAC 签名，计算 `HMAC-SHA256(responseBody, secret)` 并添加 `X-OCG-Signature` 头。
-
-## 兼容性原理
-
-OCG 通过三层拦截实现与 OpenClaw Channel 插件的完全兼容：
-
-1. **源码级拦截（ESM Loader Hook）**
-   当插件代码导入 `openclaw/plugin-sdk/*` 时，自动重定向到 OCG 的 shim 模块。Shim 保留所有真实的工具函数（路由、命令检测、会话等），只替换 dispatch 函数为 OCG 的 HTTP/ACP 转发。
-
-2. **Chunk 级拦截**
-   对于已编译的 OpenClaw chunk，loader hook 直接替换源码，以 OCG 的 dispatch 实现替代内置 Agent 引擎。
-
-3. **插件运行时**
-   OCG 构造了一个完整的 `PluginRuntime` 对象（in-memory store、logger、reply pipeline、session、routing、commands 等），Channel 插件完全感知不到自己运行在网关模式下。
+---
 
 ## 开发
 
 ```bash
-# 开发模式 (使用 tsx)
+# 开发模式（使用 tsx）
 npm run dev
 
 # 编译 TypeScript
@@ -421,32 +287,3 @@ npm run build
 # 生产运行
 npm start
 ```
-
-### 项目结构
-
-```
-openclaw-channel-gateway/
-├── bin/
-│   └── ocg.cjs                  # CLI 入口 (CJS bootstrap)
-├── src/
-│   ├── index.ts                 # 主模块入口
-│   ├── cli.ts                   # CLI 命令解析与处理
-│   ├── config.ts                # 配置加载/写入 (ocg.json)
-│   ├── gateway.ts               # 渠道生命周期管理
-│   ├── plugin-loader.ts         # 插件发现与加载
-│   ├── loader.ts                # ESM Loader Hook
-│   ├── callback-server.ts       # 异步回调 HTTP 服务器
-│   ├── auth/
-│   │   └── dingtalk-login.ts    # 钉钉设备授权流程
-│   └── shims/
-│       ├── reply-dispatch-runtime.ts  # HTTP dispatch 替换
-│       ├── runtime.ts                 # PluginRuntime 工厂
-│       ├── runtime-env.ts
-│       ├── runtime-config-snapshot.ts
-│       └── session-store-runtime.ts
-├── dist/                        # 编译产物
-├── ocg.example.json             # 配置示例
-├── tsconfig.json
-└── package.json
-```
-
