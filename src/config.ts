@@ -74,6 +74,11 @@ export type LiteGatewayConfig = {
   callbackTokenTTL?: number;
   /** Max characters per outbound reply chunk (default 4000) */
   replyChunkSize?: number;
+  /** Session model (OpenClaw-compatible) */
+  session?: {
+    /** DM session isolation scope: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer". Defaults to "per-channel-peer". */
+    dmScope?: string;
+  };
   /** OpenClaw-compatible channel configs */
   channels?: Record<string, Record<string, unknown>>;
 };
@@ -121,6 +126,9 @@ export function saveConfig(cfg: LiteGatewayConfig): void {
 export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unknown> {
   return {
     ...raw,
+    session: {
+      dmScope: raw.session?.dmScope ?? "per-channel-peer",
+    },
     liteGateway: {
       agentType: raw.agentType ?? (raw.acp ? "acp" : "http"),
       agentUrl: raw.agentUrl,
