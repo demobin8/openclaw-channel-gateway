@@ -241,6 +241,7 @@ async function httpDispatch({
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: true,
+        user: sessionKey,
       }),
       signal: AbortSignal.timeout(300_000),
     });
