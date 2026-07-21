@@ -24,7 +24,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
-import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
+import { deliverPayloadInChunks, resolveReplyChunkSize, rewriteLocalMediaPathsForDelivery } from "../reply-chunking.js";
 import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl, resolveChannelIdFromContext } from "../config.js";
 import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
 import type { DeliverFn } from "../reply-chunking.js";
@@ -332,6 +332,13 @@ async function dispatchReplyFromConfig(params: {
 
   // Resolve channel id from explicit context fields first, then SessionKey/From.
   const channelId = resolveChannelIdFromContext(ctx) || sessionKey.split(":")[0] || undefined;
+  const agentUser = channelId && !sessionKey.startsWith(`${channelId}:`)
+    ? `${channelId}:${sessionKey}`
+    : sessionKey;
+
+  /** Rewrite local file paths in reply text so QQ Bot plugin can access them. */
+  const maybeRewriteMedia = (text: string) =>
+    channelId === "qqbot" ? rewriteLocalMediaPathsForDelivery(text) : text;
 
   const agentType = resolveChannelAgentType(channelId, cfg);
 
@@ -396,7 +403,7 @@ async function dispatchReplyFromConfig(params: {
       fullText = await agent.chat(sessionKey, body, {
         onDelta: async (text) => {
           if (!streamBlocks || !text || params.replyOptions?.disableBlockStreaming === true) return;
-          dispatcher.sendBlockReply({ text, isError: false });
+          dispatcher.sendBlockReply({ text: maybeRewriteMedia(text), isError: false });
           deliveredCounts.block++;
         },
       });
@@ -406,7 +413,7 @@ async function dispatchReplyFromConfig(params: {
           async (payload) => {
             dispatcher.sendFinalReply(payload);
           },
-          { text: fullText, isError: false },
+          { text: maybeRewriteMedia(fullText), isError: false },
           { kind: "final", assistantMessageIndex: 0 },
           replyChunkSize,
         );
@@ -435,10 +442,13 @@ async function dispatchReplyFromConfig(params: {
 
     // Wrap dispatcher methods into a single deliver function
     const deliver: DeliverFn = async (payload, meta) => {
+      const rewritten = typeof payload.text === "string"
+        ? { ...payload, text: maybeRewriteMedia(payload.text) }
+        : payload;
       if (meta.kind === "block") {
-        dispatcher.sendBlockReply(payload);
+        dispatcher.sendBlockReply(rewritten);
       } else {
-        dispatcher.sendFinalReply(payload);
+        dispatcher.sendFinalReply(rewritten);
       }
     };
 
@@ -467,7 +477,7 @@ async function dispatchReplyFromConfig(params: {
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: false,
-        user: sessionKey,
+        user: agentUser,
       }),
       signal: AbortSignal.timeout(300_000),
     }).catch((err: Error) => {
@@ -490,7 +500,7 @@ async function dispatchReplyFromConfig(params: {
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: true,
-        user: sessionKey,
+        user: agentUser,
       }),
       signal: AbortSignal.timeout(300_000),
     });
@@ -509,7 +519,7 @@ async function dispatchReplyFromConfig(params: {
     // Helper: queue content — when block streaming is disabled, skip blocks
     const queueBlock = (text: string) => {
       if (disableBlockStreaming) return;
-      dispatcher.sendBlockReply({ text, isError: false });
+      dispatcher.sendBlockReply({ text: maybeRewriteMedia(text), isError: false });
       deliveredCounts.block++;
     };
 
@@ -594,7 +604,7 @@ async function dispatchReplyFromConfig(params: {
         async (payload) => {
           dispatcher.sendFinalReply(payload);
         },
-        { text: fullText, isError: false },
+        { text: maybeRewriteMedia(fullText), isError: false },
         { kind: "final", assistantMessageIndex: 0 },
         replyChunkSize,
       );

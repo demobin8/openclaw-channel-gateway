@@ -1,6 +1,6 @@
 {
   "name": "openclaw-channel-gateway",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "OpenClaw IM channel gateway — bridge Telegram/Discord/WeChat/DingTalk/QQ to any OpenAI-compatible agent API",
   "type": "module",
   "main": "dist/index.js",

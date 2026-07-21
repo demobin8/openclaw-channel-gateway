@@ -23,7 +23,7 @@ export type {
   ReplyPayload,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 
-import { deliverPayloadInChunks, resolveReplyChunkSize } from "../reply-chunking.js";
+import { deliverPayloadInChunks, resolveReplyChunkSize, rewriteLocalMediaPathsForDelivery } from "../reply-chunking.js";
 import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl, resolveChannelIdFromContext } from "../config.js";
 import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
 
@@ -57,6 +57,13 @@ async function httpDispatch({
 
   // Resolve channel id from explicit context fields first, then SessionKey/From.
   const channelId = resolveChannelIdFromContext(ctx) || sessionKey.split(":")[0] || undefined;
+  const agentUser = channelId && !sessionKey.startsWith(`${channelId}:`)
+    ? `${channelId}:${sessionKey}`
+    : sessionKey;
+
+  /** Rewrite local file paths in reply text so QQ Bot plugin can access them. */
+  const maybeRewriteMedia = (text: string) =>
+    channelId === "qqbot" ? rewriteLocalMediaPathsForDelivery(text) : text;
 
   const agentType = resolveChannelAgentType(channelId, cfg);
 
@@ -131,7 +138,7 @@ async function httpDispatch({
       fullText = await agent.chat(sessionKey, body, {
         onDelta: async (text) => {
           if (!streamBlocks || !text) return;
-          const payload = { text, isError: false };
+          const payload = { text: maybeRewriteMedia(text), isError: false };
           let finalPayload = payload;
           if (beforeDeliver) {
             const result = await beforeDeliver(payload, {
@@ -151,7 +158,7 @@ async function httpDispatch({
         },
       });
 
-      const finalPayload = { text: fullText, isError: false };
+      const finalPayload = { text: maybeRewriteMedia(fullText), isError: false };
       let finalToDeliver = finalPayload;
       if (beforeDeliver) {
         const result = await beforeDeliver(finalPayload, {
@@ -218,7 +225,7 @@ async function httpDispatch({
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: false,
-        user: sessionKey,
+        user: agentUser,
       }),
       signal: AbortSignal.timeout(300_000),
     }).catch((err: Error) => {
@@ -241,7 +248,7 @@ async function httpDispatch({
         model: modelStr,
         messages: [{ role: "user", content: body }],
         stream: true,
-        user: sessionKey,
+        user: agentUser,
       }),
       signal: AbortSignal.timeout(300_000),
     });
@@ -283,7 +290,7 @@ async function httpDispatch({
 
             fullText += content;
 
-            const payload = { text: content, isError: false };
+            const payload = { text: maybeRewriteMedia(content), isError: false };
 
             let finalPayload = payload;
             if (beforeDeliver) {
@@ -332,7 +339,7 @@ async function httpDispatch({
         fullText = content;
 
         // Deliver as final (non-streaming has no blocks)
-        const finalPayload = { text: fullText, isError: false };
+        const finalPayload = { text: maybeRewriteMedia(fullText), isError: false };
 
         let finalToDeliver = finalPayload;
         if (beforeDeliver) {
@@ -353,7 +360,7 @@ async function httpDispatch({
       } catch {
         // Not valid JSON → treat as plain text
         fullText = raw;
-        const finalPayload = { text: fullText, isError: false };
+        const finalPayload = { text: maybeRewriteMedia(fullText), isError: false };
         if (deliver) {
           deliveredCounts.final += await deliverPayloadInChunks(deliver, finalPayload, {
             kind: "final",
@@ -366,7 +373,7 @@ async function httpDispatch({
 
     // Deliver final payload (only if not already delivered in non-streaming path)
     if (!finalDelivered) {
-      const finalPayload = { text: fullText, isError: false };
+      const finalPayload = { text: maybeRewriteMedia(fullText), isError: false };
 
       let finalToDeliver = finalPayload;
       if (beforeDeliver) {

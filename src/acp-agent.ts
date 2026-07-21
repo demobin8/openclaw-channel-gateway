@@ -18,7 +18,7 @@ export type AcpAgentConfig = {
   env?: Record<string, string>;
   /** Optional system prompt retained for forward compatibility. */
   systemPrompt?: string;
-  /** Request timeout in milliseconds. Defaults to 300000. */
+  /** Request timeout in milliseconds. Defaults to 1800000 (30 minutes). */
   timeoutMs?: number;
 };
 
@@ -163,7 +163,7 @@ export class AcpAgent {
     this.model = config.model || "";
     this.cwd = config.cwd || defaultWorkspace();
     this.env = config.env;
-    this.timeoutMs = config.timeoutMs ?? 300_000;
+    this.timeoutMs = config.timeoutMs ?? 1_800_000; // 30 minutes
     this.protocol = detectAcpProtocol(this.command, this.args);
   }
 
