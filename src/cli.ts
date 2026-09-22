@@ -34,7 +34,8 @@ import {
   resolveConfigDir,
   saveConfig,
 } from "./index.js";
-import { applyConfigEnvOverrides } from "./config.js";
+import { applyConfigEnvOverrides, resolveSendSettings } from "./config.js";
+import { executeSend } from "./send-service.js";
 import { startCallbackServer, isCallbackServerRunning } from "./callback-server.js";
 import {
   startChannel,
@@ -94,6 +95,9 @@ function printHelp(): void {
   console.log("  status                        Show gateway status");
   console.log("  chat [message] [--interactive|-i]  Send terminal input through HTTP/ACP dispatch");
   console.log("                                Options: --channel <id>, --agent-type <http|acp>, --agent-url <url>, --acp-command <cmd>");
+  console.log("  send --channel <id> --to <target> --text <text>");
+  console.log("       [--account <id>] [--media-url <url>] [--reply-to <messageId>] [--chunk-prefix] [--json]");
+  console.log("                                Proactively send a message to a channel target");
   console.log("  test                          Run dispatch smoke test");
   console.log("  version                       Print version");
   console.log("  upgrade [--package-manager <pm>] [--target <version>] [--local] [--dry-run]");
@@ -548,6 +552,115 @@ async function cmdChat(command: string, args: Args): Promise<void> {
   } finally {
     rl.close();
     stopAllAcpAgents();
+  }
+}
+
+/**
+ * `ocg send` — proactive send from the CLI.
+ *
+ * Runs in its own process: it loads the channel plugin on demand (the injected
+ * plugin runtime is required by e.g. `outbound.chunker`) and does NOT share
+ * in-memory state with a running gateway — see requirements doc FR-2.
+ *
+ * Exit codes: 0 ok / 1 platform failure / 2 bad arguments / 3 disabled,
+ * not-ready or no outbound adapter.
+ */
+function sendExitCode(code: unknown): number {
+  switch (code) {
+    case undefined:
+    case null:
+      return 0;
+    case "PLATFORM_SEND_FAILED":
+      return 1;
+    case "DISABLED":
+    case "NOT_READY":
+    case "NO_OUTBOUND_ADAPTER":
+    case "INTERNAL_ERROR":
+      return 3;
+    default:
+      return 2;
+  }
+}
+
+async function cmdSend(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const emit = (body: Record<string, unknown>, exitCode: number): number => {
+    if (json) {
+      console.log(JSON.stringify(body, null, 2));
+    } else if (body.ok === true) {
+      const messageId = body.messageId ? `, messageId=${body.messageId}` : "";
+      const degraded = body.degraded === true ? ", degraded" : "";
+      console.log(
+        `[ocg] sent to ${String(body.to)} (channel=${String(body.channel)}, ` +
+        `chunks=${String(body.chunks)}${messageId}${degraded}, ${String(body.elapsedMs)}ms)`,
+      );
+    } else {
+      const partial = body.partial === true
+        ? ` (partial: ${String(body.chunksSent)}/${String(body.chunksTotal)} chunks sent)`
+        : "";
+      console.error(`[ocg] send failed: ${String(body.code)} — ${String(body.message)}${partial}`);
+    }
+    return exitCode;
+  };
+
+  const rawCfg = loadConfig();
+  if (!rawCfg) {
+    console.error("[ocg] No config found. Create ocg.json first.");
+    process.exitCode = 2;
+    return;
+  }
+
+  const settings = resolveSendSettings(rawCfg);
+  if (args["chunk-prefix"] === true) settings.chunkPrefix = true;
+
+  if (!settings.enabled) {
+    process.exitCode = emit(
+      {
+        ok: false,
+        code: "DISABLED",
+        message: "proactive send is disabled: configure sendSecret or callbackSecret to enable it",
+      },
+      3,
+    );
+    return;
+  }
+
+  const channel = typeof args.channel === "string" ? args.channel : undefined;
+  const to = typeof args.to === "string" ? args.to : undefined;
+  const text = typeof args.text === "string" ? args.text : undefined;
+  const mediaUrl = typeof args["media-url"] === "string" ? (args["media-url"] as string) : undefined;
+  const accountId = typeof args.account === "string" ? args.account : undefined;
+  const replyToId = typeof args["reply-to"] === "string" ? (args["reply-to"] as string) : undefined;
+
+  if (!channel || !to || ((text ?? "").trim() === "" && !mediaUrl)) {
+    process.exitCode = emit(
+      {
+        ok: false,
+        code: "INVALID_REQUEST",
+        message: "usage: ocg send --channel <id> --to <target> (--text <text> | --media-url <url>)",
+      },
+      2,
+    );
+    return;
+  }
+
+  applyConfigEnvOverrides(rawCfg);
+  const cfg = buildOpenClawConfig(rawCfg);
+
+  try {
+    // Plugin loading happens on demand inside executeSend (single-channel,
+    // fast) — no need to boot every installed plugin.
+    const outcome = await executeSend({
+      cfg,
+      settings,
+      request: { channel, to, text, mediaUrl, accountId, replyToId },
+    });
+    process.exitCode = emit(outcome.body, sendExitCode(outcome.body.code));
+  } catch (err) {
+    process.exitCode = emit(
+      { ok: false, code: "INTERNAL_ERROR", message: (err as Error).message },
+      3,
+    );
   }
 }
 
@@ -1061,6 +1174,7 @@ async function run(): Promise<void> {
   if (!command || command === "help") return printHelp();
   if (command === "start") return cmdStart(args);
   if (command === "version") { console.log(`ocg v${VERSION}`); return; }
+  if (command === "send") return cmdSend(args);
 
   switch (command) {
     case "stop": return cmdStop();

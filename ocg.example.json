@@ -12,6 +12,13 @@
   "apiKey": "",
   "verbose": false,
 
+  "_proactiveSend": "Proactive send (POST /ocg/send and `ocg send`) is disabled until a secret is configured.",
+  "_proactiveSendExample": "Uncomment to enable: sendSecret (falls back to callbackSecret), optional sendAllowedChannels, sendMaxBodyBytes, sendTimeoutMs, sendChunkPrefix.",
+  "_sendSecret": "",
+  "_sendAllowedChannels": ["qqbot", "telegram"],
+  "_sendTimeoutMs": 30000,
+  "_sendChunkPrefix": false,
+
   "_async": "Uncomment below for async fire-and-forget mode:",
   "_comment": "  async: true, callbackPort: 3457, callbackHost: 0.0.0.0, callbackTokenTTL: 1800",
 

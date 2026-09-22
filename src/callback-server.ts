@@ -11,6 +11,10 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { deliverPayloadInChunks } from "./reply-chunking.js";
+import { buildOpenClawConfig, loadConfig, resolveSendSettings, type SendSettings } from "./config.js";
+import { executeSend, type SendRequest } from "./send-service.js";
+import type { ChannelPluginObject } from "./plugin-loader.js";
+import { ensureChannelPluginLoaded, getChannelPlugin } from "./plugin-loader.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -87,6 +91,39 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/**
+ * Read a request body with a hard size cap.
+ *
+ * Oversized bodies are drained (not destroyed) so the 413 response can still be
+ * delivered on the same connection. Rejects with `code: "PAYLOAD_TOO_LARGE"`.
+ */
+async function readBodyLimited(req: IncomingMessage, limit: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let oversized = false;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        oversized = true;
+        chunks.length = 0;
+        return;
+      }
+      if (!oversized) chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (oversized) {
+        const err = new Error(`request body exceeds ${limit} bytes`) as NodeJS.ErrnoException;
+        err.code = "PAYLOAD_TOO_LARGE";
+        reject(err);
+        return;
+      }
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (err) => reject(err));
+  });
+}
+
 // ── HMAC verification ──────────────────────────────────────────────────
 
 function verifyHmac(
@@ -143,18 +180,129 @@ export function getCallbackPort(): number {
   return _boundPort;
 }
 
+// ── Proactive send route (POST /ocg/send) ──────────────────────────────────
+
+/**
+ * Injection seam for the send route: production reads config + the plugin
+ * registry; tests supply fixtures.
+ */
+export type SendRouteContext = {
+  getSettings: () => SendSettings;
+  getConfig: () => Record<string, unknown>;
+  getPlugin?: (channelId: string) => ChannelPluginObject | null;
+  loadPlugin?: (channelId: string) => Promise<ChannelPluginObject | null>;
+};
+
+function defaultSendRouteContext(): SendRouteContext {
+  return {
+    getSettings: () => resolveSendSettings(loadConfig()),
+    getConfig: () => buildOpenClawConfig(loadConfig() ?? {}),
+    getPlugin: getChannelPlugin,
+    loadPlugin: ensureChannelPluginLoaded,
+  };
+}
+
+/**
+ * Handle `POST /ocg/send`.
+ *
+ * Auth is deliberately first-class: with no configured secret the endpoint
+ * answers `403 DISABLED` (a sandbox-local port must never relay messages for
+ * unauthenticated callers), and with a secret the raw body must carry a valid
+ * `X-OCG-Signature` HMAC.
+ */
+async function handleSendRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: SendRouteContext,
+): Promise<void> {
+  let settings: SendSettings;
+  try {
+    settings = ctx.getSettings();
+  } catch (err) {
+    jsonBody(res, 500, { ok: false, code: "INTERNAL_ERROR", message: (err as Error).message });
+    return;
+  }
+
+  if (!settings.enabled) {
+    jsonBody(res, 403, {
+      ok: false,
+      code: "DISABLED",
+      message: "proactive send is disabled: configure sendSecret or callbackSecret to enable it",
+    });
+    return;
+  }
+
+  let rawBody: Buffer;
+  try {
+    rawBody = await readBodyLimited(req, settings.maxBodyBytes);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "PAYLOAD_TOO_LARGE") {
+      jsonBody(res, 413, {
+        ok: false,
+        code: "PAYLOAD_TOO_LARGE",
+        message: (err as Error).message,
+      });
+      return;
+    }
+    jsonBody(res, 400, { ok: false, code: "INVALID_REQUEST", message: (err as Error).message });
+    return;
+  }
+
+  if (settings.secret && !verifyHmac(rawBody, req.headers["x-ocg-signature"] as string | undefined, settings.secret)) {
+    console.warn("[ocg] send HMAC verification failed");
+    jsonBody(res, 401, {
+      ok: false,
+      code: "BAD_SIGNATURE",
+      message: "signature verification failed",
+    });
+    return;
+  }
+
+  let request: SendRequest;
+  try {
+    const parsed: unknown = JSON.parse(rawBody.toString("utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("body must be a JSON object");
+    }
+    request = parsed as SendRequest;
+  } catch (err) {
+    jsonBody(res, 400, { ok: false, code: "INVALID_REQUEST", message: (err as Error).message });
+    return;
+  }
+
+  try {
+    const outcome = await executeSend({
+      cfg: ctx.getConfig(),
+      settings,
+      request,
+      deps: {
+        ...(ctx.getPlugin ? { getPlugin: ctx.getPlugin } : {}),
+        ...(ctx.loadPlugin ? { loadPlugin: ctx.loadPlugin } : {}),
+      },
+    });
+    jsonBody(res, outcome.httpStatus, outcome.body);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[ocg] send error: ${msg}`);
+    jsonBody(res, 500, { ok: false, code: "INTERNAL_ERROR", message: msg });
+  }
+}
+
 /**
  * Start the callback HTTP server.
  *
  * @param host - bind address (default "127.0.0.1")
  * @param port - bind port (default 3457)
  * @param secret - optional HMAC shared secret for signature verification
+ * @param options.send - injection seam for the `/ocg/send` route (tests)
  * @returns the bound port number
  */
 export async function startCallbackServer(
   host: string,
   port: number,
   secret?: string,
+  options: { send?: SendRouteContext } = {},
 ): Promise<number> {
   if (server) {
     console.warn("[ocg] callback server already running");
@@ -162,6 +310,7 @@ export async function startCallbackServer(
   }
 
   _callbackSecret = secret ?? null;
+  const sendCtx = options.send ?? defaultSendRouteContext();
 
   server = createServer(async (req, res) => {
     // CORS for agent backends on other ports
@@ -175,8 +324,15 @@ export async function startCallbackServer(
       return;
     }
 
-    // Route: POST /ocg/callback/{token}
     const url = req.url ?? "/";
+
+    // Route: POST /ocg/send (proactive send)
+    if (req.method === "POST" && /^\/ocg\/send(?:\?.*)?$/.test(url)) {
+      await handleSendRequest(req, res, sendCtx);
+      return;
+    }
+
+    // Route: POST /ocg/callback/{token}
     const match = url.match(/^\/ocg\/callback\/([a-f0-9]{64})(?:\?.*)?$/);
 
     if (req.method !== "POST" || !match) {
@@ -253,20 +409,46 @@ export async function startCallbackServer(
       _boundPort = typeof addr === "string" ? port : addr?.port ?? port;
       const hmacInfo = _callbackSecret ? " (HMAC enabled)" : "";
       console.log(`[ocg] Callback server listening on http://${host}:${_boundPort}${hmacInfo}`);
+      try {
+        const sendSettings = sendCtx.getSettings();
+        if (sendSettings.enabled) {
+          const scope = sendSettings.allowedChannels
+            ? `channels: ${sendSettings.allowedChannels.join(", ")}`
+            : "all configured channels";
+          console.log(`[ocg] Proactive send enabled on POST /ocg/send (${scope})`);
+        } else {
+          console.log("[ocg] Proactive send disabled (set sendSecret or callbackSecret to enable)");
+        }
+      } catch {
+        // Settings are advisory at startup; the route re-resolves them per request.
+      }
       resolve(_boundPort);
     });
   });
 }
 
-/** Stop the callback server */
+/**
+ * Stop the callback server.
+ *
+ * Closes idle keep-alive connections explicitly (an HTTP client that talks to
+ * `/ocg/send` may hold a socket open indefinitely) and falls back to a short
+ * timer so shutdown can never hang the CLI / gateway.
+ */
 export async function stopCallbackServer(): Promise<void> {
   if (!server) return;
+  const instance = server;
   return new Promise((resolve) => {
-    server!.close(() => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
       server = null;
       _boundPort = 0;
       resolve();
-    });
+    };
+    instance.close(() => finish());
+    instance.closeAllConnections?.();
+    setTimeout(finish, 3000).unref?.();
   });
 }
 

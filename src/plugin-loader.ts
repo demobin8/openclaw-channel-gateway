@@ -19,7 +19,7 @@ const __pluginDirname = path.dirname(fileURLToPath(import.meta.url));
 // ── Types ────────────────────────────────────────────────────────────────
 
 /** Resolved account shape returned by a plugin's config.resolveAccount() */
-type ResolvedAccount = {
+export type ResolvedAccount = {
   accountId: string;
   enabled: boolean;
   name?: string;
@@ -27,7 +27,7 @@ type ResolvedAccount = {
 };
 
 /** Minimal config adapter exposed by OpenClaw channel plugins */
-type ChannelConfigAdapter = {
+export type ChannelConfigAdapter = {
   listAccountIds: (cfg: Record<string, unknown>) => string[];
   resolveAccount: (cfg: Record<string, unknown>, accountId?: string | null) => ResolvedAccount;
   defaultAccountId?: (cfg: Record<string, unknown>) => string;
@@ -40,8 +40,57 @@ type ChannelConfigAdapter = {
   [key: string]: unknown;
 };
 
+/** Normalized result returned by a plugin's outbound sendText/sendMedia. */
+export type OutboundDeliveryResultLike = {
+  channel?: string;
+  messageId?: string;
+  receipt?: unknown;
+  meta?: Record<string, unknown>;
+  /** Some plugins return `{ error }` instead of throwing (see requirements §3.7.4). */
+  error?: unknown;
+};
+
+/**
+ * Minimal outbound adapter surface exposed by OpenClaw channel plugins.
+ *
+ * `sendText` / `sendMedia` receive ALREADY-chunked, ALREADY-sanitized text —
+ * chunking and sanitization are declarations executed by the delivery
+ * pipeline, so OCG layers them itself (see `send-service.ts`).
+ */
+export type ChannelOutboundAdapterLike = {
+  deliveryMode?: string;
+  chunker?: ((text: string, limit: number, ctx?: unknown) => string[]) | null;
+  chunkerMode?: "text" | "markdown";
+  textChunkLimit?: number;
+  sanitizeText?: (params: { text: string; payload: Record<string, unknown> }) => string;
+  resolveEffectiveTextChunkLimit?: (params: {
+    cfg: Record<string, unknown>;
+    accountId?: string | null;
+    fallbackLimit?: number;
+  }) => number | undefined;
+  resolveTarget?: (params: {
+    cfg?: Record<string, unknown>;
+    to?: string;
+    accountId?: string | null;
+    mode?: string;
+  }) => { ok: true; to: string } | { ok: false; error: Error };
+  sendText?: (ctx: Record<string, unknown>) => Promise<OutboundDeliveryResultLike>;
+  sendMedia?: (ctx: Record<string, unknown>) => Promise<OutboundDeliveryResultLike>;
+};
+
+/** Minimal messaging adapter surface (target normalization / hints). */
+export type ChannelMessagingLike = {
+  targetPrefixes?: string[];
+  normalizeTarget?: (raw: string) => string | null | undefined;
+  targetResolver?: {
+    looksLikeId?: (raw: string, normalized?: string) => boolean;
+    hint?: string;
+    resolveTarget?: ChannelOutboundAdapterLike["resolveTarget"];
+  };
+};
+
 /** ChannelPlugin object shape loaded from an OpenClaw-compatible plugin */
-type ChannelPluginObject = {
+export type ChannelPluginObject = {
   id?: string;
   meta?: { id?: string; label?: string };
   gateway?: {
@@ -61,6 +110,10 @@ type ChannelPluginObject = {
   };
   config?: ChannelConfigAdapter;
   capabilities?: { chatTypes?: string[]; [key: string]: unknown };
+  /** Outbound send primitives (proactive send). */
+  outbound?: ChannelOutboundAdapterLike;
+  /** Messaging declarations: target normalization + hints. */
+  messaging?: ChannelMessagingLike;
   [key: string]: unknown;
 };
 
@@ -426,6 +479,26 @@ export async function loadAllPlugins(): Promise<void> {
 
 export function getChannelPlugin(id: string): ChannelPluginObject | null {
   return loadedPlugins.get(id) ?? null;
+}
+
+/**
+ * Ensure a single channel plugin is loaded, loading it on demand when needed.
+ *
+ * Used by proactive send (`/ocg/send`, `ocg send`): both need the plugin object
+ * (and its injected runtime) without requiring the channel to be running —
+ * see requirements doc §3.7.3.
+ */
+export async function ensureChannelPluginLoaded(
+  id: string,
+): Promise<ChannelPluginObject | null> {
+  const existing = loadedPlugins.get(id);
+  if (existing) return existing;
+
+  const candidates = [...discoverBundledPlugins(), ...discoverExternalPlugins()];
+  const match = candidates.find((candidate) => candidate.id === id);
+  if (!match) return null;
+
+  return await loadChannelPlugin(match);
 }
 
 export function listLoadedPlugins(): string[] {

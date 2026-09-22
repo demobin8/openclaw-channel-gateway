@@ -30,8 +30,11 @@ export {
   listAllChannels,
   getChannelSection,
   buildOpenClawConfig,
+  resolveSendSettings,
 } from "./config.js";
-export type { LiteGatewayConfig } from "./config.js";
+export type { LiteGatewayConfig, SendSettings } from "./config.js";
+export { executeSend } from "./send-service.js";
+export type { SendRequest, SendOutcome } from "./send-service.js";
 export {
   startChannel,
   stopChannel,

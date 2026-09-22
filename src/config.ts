@@ -74,6 +74,24 @@ export type LiteGatewayConfig = {
   callbackTokenTTL?: number;
   /** Max characters per outbound reply chunk (default 4000) */
   replyChunkSize?: number;
+  /**
+   * Proactive send: enable the /ocg/send endpoint and `ocg send`.
+   * Default: enabled when a secret is configured (see sendSecret/callbackSecret).
+   * Explicit false disables the capability entirely.
+   */
+  sendEnabled?: boolean;
+  /** HMAC shared secret for /ocg/send. Falls back to callbackSecret. */
+  sendSecret?: string;
+  /** Optional channel whitelist for proactive send. Unset = all configured channels. */
+  sendAllowedChannels?: string[];
+  /** Hard limit for send text length. Unset = use the plugin's textChunkLimit. */
+  sendMaxTextLength?: number;
+  /** Max request body size for /ocg/send in bytes (default 1048576 = 1 MiB). */
+  sendMaxBodyBytes?: number;
+  /** Proactive send timeout in milliseconds (default 30000). */
+  sendTimeoutMs?: number;
+  /** Prefix each outbound chunk with "[i/n]" like the reply path (default false). */
+  sendChunkPrefix?: boolean;
   /** Session model (OpenClaw-compatible) */
   session?: {
     /** DM session isolation scope: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer". Defaults to "per-channel-peer". */
@@ -144,6 +162,61 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
       callbackTokenTTL: raw.callbackTokenTTL,
       replyChunkSize: raw.replyChunkSize,
     },
+  };
+}
+
+// ── Proactive send settings ────────────────────────────────────────────────
+
+export const DEFAULT_SEND_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
+export const DEFAULT_SEND_TIMEOUT_MS = 30_000;
+
+/** Normalized proactive-send settings derived from config. */
+export type SendSettings = {
+  /** Capability is usable: sendEnabled !== false AND a secret is available. */
+  enabled: boolean;
+  /** HMAC shared secret (sendSecret, falling back to callbackSecret). */
+  secret: string | null;
+  /** Channel whitelist, or null when every configured channel is allowed. */
+  allowedChannels: string[] | null;
+  /** Hard text-length limit, or null when the plugin's chunk limit applies. */
+  maxTextLength: number | null;
+  maxBodyBytes: number;
+  timeoutMs: number;
+  /** Prefix each chunk with "[i/n]" (reply-path compatibility). */
+  chunkPrefix: boolean;
+};
+
+function positiveInt(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * Resolve proactive-send settings.
+ *
+ * Enabled rule (see requirements doc FR-7): the capability requires a shared
+ * secret — `sendEnabled: false` disables it explicitly, and with no secret at
+ * all the endpoint reports `403 DISABLED` so an unauthenticated sandbox can
+ * never send on behalf of the gateway.
+ */
+export function resolveSendSettings(raw: LiteGatewayConfig | null | undefined): SendSettings {
+  const cfg = raw ?? {};
+  const secret = (cfg.sendSecret?.trim() || cfg.callbackSecret?.trim() || "") || null;
+  const allowed = Array.isArray(cfg.sendAllowedChannels)
+    ? cfg.sendAllowedChannels.filter((id): id is string => typeof id === "string" && id.trim() !== "")
+    : null;
+  const maxTextLength = cfg.sendMaxTextLength === undefined
+    ? null
+    : positiveInt(cfg.sendMaxTextLength, 0) || null;
+
+  return {
+    enabled: cfg.sendEnabled !== false && secret !== null,
+    secret,
+    allowedChannels: allowed && allowed.length > 0 ? allowed : null,
+    maxTextLength,
+    maxBodyBytes: positiveInt(cfg.sendMaxBodyBytes, DEFAULT_SEND_MAX_BODY_BYTES),
+    timeoutMs: positiveInt(cfg.sendTimeoutMs, DEFAULT_SEND_TIMEOUT_MS),
+    chunkPrefix: cfg.sendChunkPrefix === true,
   };
 }
 

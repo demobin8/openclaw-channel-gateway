@@ -169,6 +169,7 @@ ocg start
 | `ocg stop` | 停止所有渠道 |
 | `ocg restart` | 重启所有渠道 |
 | `ocg status` | 查看网关状态，包括后台启动的渠道 |
+| `ocg send --channel <id> --to <目标> --text <文本>` | 主动发送消息到指定渠道目标（见[主动发送](#主动发送)） |
 | `ocg test` | 运行 dispatch 冒烟测试 |
 | `ocg version` | 显示版本号 |
 | `ocg upgrade [--target <version>]` | 升级 OCG CLI 包 |
@@ -275,6 +276,98 @@ X-OCG-Signature: sha256=<hex-digest>
 
 ---
 
+## 主动发送
+
+回复链路由入站消息触发。**主动发送**是反方向：由 agent 或运维指定"通道 + 账号 + 目标 + 文本（可选媒体）"，让 OCG 投递一条**没有入站消息来源**的消息（定时报告、长任务结果、告警）。
+
+两个入口共用同一实现：
+
+- **HTTP** —— `POST /ocg/send`（与 `/ocg/callback` 同进程、同端口）
+- **CLI** —— `ocg send ...`
+
+### 启用
+
+能力**在配置 secret 之前默认关闭**——不能让未鉴权的调用方以网关身份发消息。
+
+| 配置键 | 默认 | 说明 |
+|---|---|---|
+| `sendEnabled` | 有 secret 即启用 | 显式 `false` 可彻底关闭 |
+| `sendSecret` | 回落 `callbackSecret` | `/ocg/send` 的 HMAC-SHA256 共享密钥 |
+| `sendAllowedChannels` | 全部已配置通道 | 通道白名单，白名单外返回 `404 UNKNOWN_CHANNEL` |
+| `sendMaxTextLength` | — | 文本硬上限（超出返回 `400 INVALID_REQUEST`） |
+| `sendMaxBodyBytes` | `1048576`（1 MiB） | 请求体上限（超出返回 `413 PAYLOAD_TOO_LARGE`） |
+| `sendTimeoutMs` | `30000` | 平台发送超时（超时返回 `502` + `reason: "timeout"` + `uncertain: true`） |
+| `sendChunkPrefix` | `false` | 为每个分片加 `[i/n]` 前缀（与回复路径一致） |
+
+```json
+{
+  "callbackSecret": "shared-secret",
+  "sendSecret": "shared-secret",
+  "sendAllowedChannels": ["qqbot", "telegram"]
+}
+```
+
+### HTTP
+
+```bash
+BODY='{"channel":"qqbot","to":"qqbot:c2c:OPENID","text":"报告已生成"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "shared-secret" -hex | sed 's/.*= //')
+curl -X POST http://127.0.0.1:3457/ocg/send \
+  -H "Content-Type: application/json" \
+  -H "X-OCG-Signature: sha256=$SIG" \
+  -d "$BODY"
+```
+
+请求字段：`channel`（必填）、`to`（必填，插件规范化目标）、`text` / `mediaUrl`（至少一个）、`accountId`（默认 `default`）、`replyToId`、`clientRef`（仅用于日志关联）。未列出的字段忽略。
+
+```json
+{
+  "ok": true,
+  "channel": "qqbot",
+  "to": "qqbot:c2c:***",
+  "chunks": 1,
+  "messageId": "1023",
+  "degraded": false,
+  "targetValidated": false,
+  "elapsedMs": 412
+}
+```
+
+错误码：`400 INVALID_REQUEST` / `UNKNOWN_ACCOUNT` / `INVALID_TARGET`、`401 BAD_SIGNATURE`、`403 DISABLED`、`404 UNKNOWN_CHANNEL`、`413 PAYLOAD_TOO_LARGE`、`501 NO_OUTBOUND_ADAPTER`、`502 PLATFORM_SEND_FAILED`（平台错误原样透传，能解析出错误码时带 `platformCode`）、`503 NOT_READY`。**不做隐式重试**——重试策略由调用方负责。
+
+### CLI
+
+```bash
+ocg send --channel qqbot --to qqbot:group:123456789 --text "每日报告已生成" --json
+ocg send --channel telegram --to "123456789" --text "hello" --account default
+ocg send --channel qqbot --to qqbot:c2c:OPENID --media-url https://example.com/x.png
+```
+
+退出码：`0` 成功 / `1` 平台失败（含超时）/ `2` 参数错误 / `3` 未启用、未就绪或无 outbound 适配器。
+
+`ocg send` 是独立进程、按需加载插件，因此**不要求** gateway 正在运行；但它与网关进程**不共享内存态**（账号运行态、插件内部限流计数），需要与在线网关协同的投递请优先走 HTTP 端点。
+
+### 投递语义
+
+- 分片与清洗遵循**插件自身的规则**（`chunker` / `chunkerMode` / `textChunkLimit`，如 Telegram 4096、QQ 5000），与回复路径（`replyChunkSize` 4000 + `[i/n]` 前缀）不同；需要回复风格前缀时打开 `sendChunkPrefix: true`。
+- `mediaUrl` 支持 http(s)；本地路径是否可用由插件决定（QQ 需放在 `~/.openclaw/media/...`）。插件无 `sendMedia` 时降级为"文本 + 链接"，响应标注 `degraded: true`。
+- `replyToId` 只作用于首个分片。
+- 插件为按需加载，其耗时不计入 `sendTimeoutMs`。
+
+### 平台主动推送限制
+
+主动消息受平台侧规则约束，OCG 无法绕过，平台错误原样返回：
+
+| 通道 | 已知限制 | 典型错误 |
+|---|---|---|
+| QQ Bot | 非会话窗口内的主动消息受限 | `PLATFORM_SEND_FAILED` + 平台原始消息（如超出可发送窗口） |
+| Telegram | Bot 不能主动发起会话，用户需先与 bot 对话 | `403: bot can't initiate conversation with a user` |
+| 全部 | 内容风控 / 频次限制 | `message` 中的平台错误码 |
+
+遇到这类错误请联系对应平台支持。
+
+---
+
 ## 开发
 
 ```bash
@@ -286,4 +379,7 @@ npm run build
 
 # 生产运行
 npm start
+
+# 主动发送冒烟测试（mock 插件 + 真实 HTTP 路由）
+npx tsx src/send-test.ts
 ```

@@ -169,6 +169,7 @@ That's it — OCG will start all enabled channels and begin forwarding messages 
 | `ocg stop` | Stop all channels |
 | `ocg restart` | Restart all channels |
 | `ocg status` | Show gateway status, including background-started channels |
+| `ocg send --channel <id> --to <target> --text <text>` | Proactively send a message to a channel target (see [Proactive Send](#proactive-send)) |
 | `ocg test` | Run dispatch smoke test |
 | `ocg version` | Print version |
 | `ocg upgrade [--target <version>]` | Upgrade the OCG CLI package |
@@ -275,6 +276,100 @@ Each callback token is single-use and expires after `callbackTokenTTL` seconds.
 
 ---
 
+## Proactive Send
+
+Replies are driven by inbound messages. **Proactive send** is the opposite direction: your agent (or an operator) asks OCG to deliver a message to an IM target that did not come from an inbound message — scheduled reports, long-task results, alerts.
+
+Two entry points share one implementation:
+
+- **HTTP** — `POST /ocg/send` on the callback server (same process/port as `/ocg/callback`)
+- **CLI** — `ocg send ...`
+
+### Enable it
+
+The capability is **off until a secret is configured** — an unauthenticated caller must never be able to send messages on your behalf.
+
+| Config key | Default | Description |
+|---|---|---|
+| `sendEnabled` | enabled when a secret exists | Set `false` to disable the capability explicitly |
+| `sendSecret` | falls back to `callbackSecret` | HMAC-SHA256 shared secret for `/ocg/send` |
+| `sendAllowedChannels` | all configured channels | Channel whitelist; other channels answer `404 UNKNOWN_CHANNEL` |
+| `sendMaxTextLength` | — | Hard text limit (`400 INVALID_REQUEST` when exceeded) |
+| `sendMaxBodyBytes` | `1048576` (1 MiB) | HTTP body limit (`413 PAYLOAD_TOO_LARGE`) |
+| `sendTimeoutMs` | `30000` | Platform send timeout (`502` with `reason: "timeout"`, `uncertain: true`) |
+| `sendChunkPrefix` | `false` | Prefix each chunk with `[i/n]`, matching the reply path |
+
+```json
+{
+  "callbackSecret": "shared-secret",
+  "sendSecret": "shared-secret",
+  "sendAllowedChannels": ["qqbot", "telegram"]
+}
+```
+
+### HTTP
+
+```bash
+BODY='{"channel":"qqbot","to":"qqbot:c2c:OPENID","text":"Report is ready"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "shared-secret" -hex | sed 's/.*= //')
+curl -X POST http://127.0.0.1:3457/ocg/send \
+  -H "Content-Type: application/json" \
+  -H "X-OCG-Signature: sha256=$SIG" \
+  -d "$BODY"
+```
+
+Request fields: `channel` (required), `to` (required, plugin-normalized target), `text` / `mediaUrl` (at least one), `accountId` (default `default`), `replyToId`, `clientRef` (logging correlation only). Unknown fields are ignored.
+
+```json
+{
+  "ok": true,
+  "channel": "qqbot",
+  "to": "qqbot:c2c:***",
+  "chunks": 1,
+  "chunksSent": 1,
+  "chunksTotal": 1,
+  "messageId": "1023",
+  "degraded": false,
+  "targetValidated": false,
+  "elapsedMs": 412
+}
+```
+
+Error codes: `400 INVALID_REQUEST` / `UNKNOWN_ACCOUNT` / `INVALID_TARGET`, `401 BAD_SIGNATURE`, `403 DISABLED`, `404 UNKNOWN_CHANNEL`, `413 PAYLOAD_TOO_LARGE`, `501 NO_OUTBOUND_ADAPTER`, `502 PLATFORM_SEND_FAILED` (platform errors are passed through; `platformCode` is included when it can be parsed), `503 NOT_READY`. **No implicit retries** — retry policy belongs to the caller.
+
+### CLI
+
+```bash
+ocg send --channel qqbot --to qqbot:group:123456789 --text "Daily report is ready" --json
+ocg send --channel telegram --to "123456789" --text "hello" --account default
+ocg send --channel qqbot --to qqbot:c2c:OPENID --media-url https://example.com/x.png
+```
+
+Exit codes: `0` sent / `1` platform failure (including timeout) / `2` bad arguments / `3` disabled, not ready, or no outbound adapter.
+
+`ocg send` runs in its own process and loads the channel plugin on demand, so it works without a running gateway. It does **not** share in-memory state with the gateway process (account runtime state, plugin-side rate-limit counters), so prefer the HTTP endpoint for delivery that must be coordinated with a live gateway.
+
+### Delivery semantics
+
+- Messages are chunked with the channel plugin's own rules (`chunker` / `chunkerMode` / `textChunkLimit`, e.g. Telegram 4096, QQ 5000) and sanitized with its `sanitizeText`. That differs from the reply path, which uses `replyChunkSize` (4000) plus `[i/n]` prefixes — set `sendChunkPrefix: true` if you want the reply-style prefix.
+- `mediaUrl` supports http(s). Local paths are only accepted when the plugin allows them (put files under `~/.openclaw/media/...` for QQ). If a plugin has no `sendMedia`, the link is appended to the text and the response reports `degraded: true`.
+- `replyToId` applies to the first chunk only.
+- Plugin loading is lazy and is not charged against `sendTimeoutMs`.
+
+### Platform push limits
+
+Proactive messages are subject to platform-side rules that OCG cannot bypass — the platform's error is returned as-is:
+
+| Channel | Known constraint | Typical error |
+|---|---|---|
+| QQ Bot | Proactive messages are limited outside an active conversation window | `PLATFORM_SEND_FAILED` with the platform message (e.g. window exceeded) |
+| Telegram | A bot cannot initiate a chat; the user must have started it | `403: bot can't initiate conversation with a user` |
+| All | Content moderation / rate limits | Platform-specific code in `message` |
+
+Support request when you see one of these.
+
+---
+
 ## Development
 
 ```bash
@@ -286,4 +381,7 @@ npm run build
 
 # Production run
 npm start
+
+# Proactive send smoke test (mock plugin + real HTTP route)
+npx tsx src/send-test.ts
 ```
