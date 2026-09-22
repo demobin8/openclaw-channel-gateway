@@ -206,9 +206,9 @@ qqbot 主动发送走 `!replyToId` 分支：`sendText` → `sendText$1(deliveryT
 | 路径 | 做法 | 代价 / 风险 | 建议 |
 | --- | --- | --- | --- |
 | A. 手工编排（推荐） | OCG 调 `plugin.outbound.sendText/sendMedia`，自己实现 `sanitizeText` → 分片 → 逐片发送 → 聚合 | 需复刻管线语义（约 100–150 行），且要跟 SDK 的 helper 保持同步 | **本版采用**：依赖少、可测、不碰 OpenClaw 内部状态 |
-| B. 复用 `deliverOutboundPayloads` | 调 `openclaw/plugin-sdk/outbound-runtime`（`deliver-xKwLODDt.d.ts:116`） | 它从 OpenClaw **全局 plugin registry** 取 adapter（`load-BBQWnOQX.js:12-23`），而 OCG 的 loader 只 `import` 模块、从不注册 registry（`src/plugin-loader.ts:218`、`:427`）→ 需要额外 bootstrap 或自建 registry 注入，耦合 OpenClaw 内部实现，升级易碎 | 暂不采用；若后续通道增多再评估 |
+| B. 复用 `deliverOutboundPayloads` | 调 `openclaw/plugin-sdk/outbound-runtime`（`deliver-xKwLODDt.d.ts:116`） | 它从 OpenClaw **全局 plugin registry** 取 adapter（`load-BBQWnOQX.js:12-23`），而 OCG 的 loader 只 `import` 模块、从不注册 registry（`src/plugin-loader.ts:218`、`:427`）→ 需要额外 bootstrap 或自建 registry 注入，耦合 OpenClaw 内部实现，升级易碎 | **已确认不可行（v1.2.1 复核）**：该入口在 **openclaw 2026.9.5 中已被上游移除**（`exports` 仅剩 `channel-outbound` / `outbound-media` / `outbound-echo-runtime`；2026.6.6 起即标注 deprecated / compatibility substrate）。其继任 API（`sendDurableMessageBatch`、`createChannelMessageAdapterFromOutbound`、`deliverInboundReplyWithMessageSendContext`，位于 `plugin-sdk/channel-outbound`、`channel-message`）依赖 OpenClaw 自身的 plugin registry 与消息生命周期（队列 / identity / journal），不适用于瘦网关。**不再评估路径 B。** |
 
-路径 A 需要使用的 SDK 入口（都是公开导出，不要 deep-import `dist/<hash>.js`）：
+路径 A 需要使用的 SDK 入口（都是公开导出，不要 deep-import `dist/<hash>.js`）。**v1.2.1 起改为懒加载 + 可选**：入口缺失时回退到插件 `chunker`，再回退到 OCG 内置分片器（`splitReplyText`），避免上游改名导致所有 `ocg` 命令启动失败：
 
 - `openclaw/plugin-sdk/text-chunking`：`chunkText` / `chunkMarkdownText` / `chunkTextWithMode` / `chunkMarkdownTextWithMode` / `chunkByNewline`
 - `openclaw/plugin-sdk/channel-targets`：目标解析 helper

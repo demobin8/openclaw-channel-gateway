@@ -55,6 +55,8 @@ function chunkByLength(text: string, limit: number): string[] {
 function createMockPlugin(options: {
   withOutbound?: boolean;
   withSendMedia?: boolean;
+  withChunker?: boolean;
+  textChunkLimit?: number;
   configured?: boolean;
   validateTarget?: boolean;
   sendText?: (ctx: Call, callIndex: number) => Promise<Record<string, unknown>>;
@@ -64,6 +66,8 @@ function createMockPlugin(options: {
   const {
     withOutbound = true,
     withSendMedia = true,
+    withChunker = true,
+    textChunkLimit = 20,
     configured = true,
     validateTarget = true,
   } = options;
@@ -96,11 +100,15 @@ function createMockPlugin(options: {
     plugin.outbound = {
       deliveryMode: "direct",
       chunkerMode: "markdown",
-      textChunkLimit: 20,
-      chunker: (text: string, limit: number) => {
-        state.chunkerCalls += 1;
-        return chunkByLength(text, limit);
-      },
+      textChunkLimit,
+      ...(withChunker
+        ? {
+            chunker: (text: string, limit: number) => {
+              state.chunkerCalls += 1;
+              return chunkByLength(text, limit);
+            },
+          }
+        : {}),
       sanitizeText: ({ text }: { text: string }) => {
         state.sanitizeCalls += 1;
         return text.trim();
@@ -475,6 +483,35 @@ section("8. HTTP /ocg/send route");
   const disabledBody = await disabledRes.json() as Record<string, unknown>;
   check("no secret → 403 DISABLED", disabledRes.status === 403 && disabledBody.code === "DISABLED", disabledBody);
   await stopCallbackServer();
+}
+
+// ── 9. SDK chunking helpers missing → built-in fallback (1.2.1 hardening) ──
+
+section("9. SDK absent fallback");
+{
+  // No plugin `chunker` either: only the built-in splitter can do the work.
+  const { plugin, calls } = createMockPlugin({ withChunker: false, textChunkLimit: 20 });
+  const outcome = await executeSend({
+    cfg: BASE_CFG,
+    settings: ENABLED,
+    request: { channel: "mock", to: "mock:c2c:abc123", text: "E".repeat(45) },
+    deps: { ...depsFor(plugin), loadSdkChunking: async () => null },
+  });
+
+  check("SDK missing still sends (200)", outcome.httpStatus === 200, outcome.body);
+  check("built-in splitter produced 3 chunks", outcome.body.chunks === 3, outcome.body);
+  check("3 sendText calls", calls.length === 3, calls.length);
+  check("each chunk within the declared limit", calls.every((c) => Array.from(String(c.text)).length <= 20), calls.map((c) => String(c.text).length));
+
+  // SDK present is still the preferred path (no plugin chunker here either).
+  const withSdk = createMockPlugin({ withChunker: false, textChunkLimit: 20 });
+  const sdkOutcome = await executeSend({
+    cfg: BASE_CFG,
+    settings: ENABLED,
+    request: { channel: "mock", to: "mock:c2c:abc123", text: "F".repeat(45) },
+    deps: depsFor(withSdk.plugin),
+  });
+  check("SDK present → 3 chunks (SDK helper)", sdkOutcome.httpStatus === 200 && sdkOutcome.body.chunks === 3, sdkOutcome.body);
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────

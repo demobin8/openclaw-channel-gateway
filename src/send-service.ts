@@ -19,14 +19,8 @@
  * Deliberately stateless: no queue, no retry, no idempotency store.
  */
 
-import {
-  chunkMarkdownTextWithMode,
-  chunkTextWithMode,
-  resolveChunkMode,
-  resolveTextChunkLimit,
-} from "openclaw/plugin-sdk/reply-chunking";
 import type { SendSettings } from "./config.js";
-import { resolveReplyChunkSize } from "./reply-chunking.js";
+import { resolveReplyChunkSize, splitReplyText } from "./reply-chunking.js";
 import type {
   ChannelOutboundAdapterLike,
   ChannelPluginObject,
@@ -34,6 +28,51 @@ import type {
   ResolvedAccount,
 } from "./plugin-loader.js";
 import { ensureChannelPluginLoaded, getChannelPlugin } from "./plugin-loader.js";
+
+// ── OpenClaw SDK chunking helpers (loaded lazily, with a built-in fallback) ──
+
+/**
+ * The SDK surface OCG uses from `openclaw/plugin-sdk/reply-chunking`.
+ *
+ * Loaded lazily and treated as optional: upstream has already removed public
+ * entries once (`plugin-sdk/outbound-runtime` disappeared in openclaw 2026.9.5),
+ * so a rename must not take down every `ocg` command at process start. Without
+ * it we fall back to the plugin's own `chunker` declaration or, failing that,
+ * OCG's built-in splitter.
+ */
+export type SdkChunking = {
+  chunkTextWithMode: (text: string, limit: number, mode: ChunkMode) => string[];
+  chunkMarkdownTextWithMode: (text: string, limit: number, mode: ChunkMode) => string[];
+  resolveChunkMode: (cfg: unknown, provider?: string, accountId?: string | null) => ChunkMode;
+  resolveTextChunkLimit: (
+    cfg: unknown,
+    provider?: string,
+    accountId?: string | null,
+    opts?: { fallbackLimit?: number },
+  ) => number;
+};
+
+let sdkChunkingPromise: Promise<SdkChunking | null> | null = null;
+let sdkChunkingWarned = false;
+
+/** Load the SDK chunking helpers once per process; null when unavailable. */
+export function loadSdkChunking(): Promise<SdkChunking | null> {
+  if (!sdkChunkingPromise) {
+    sdkChunkingPromise = import("openclaw/plugin-sdk/reply-chunking")
+      .then((mod) => mod as unknown as SdkChunking)
+      .catch((err: unknown) => {
+        if (!sdkChunkingWarned) {
+          sdkChunkingWarned = true;
+          console.warn(
+            "[ocg] openclaw plugin-sdk chunking helpers unavailable " +
+            `(${(err as Error).message}); using built-in chunking`,
+          );
+        }
+        return null;
+      });
+  }
+  return sdkChunkingPromise;
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -52,6 +91,8 @@ export type SendRequest = {
 export type SendDeps = {
   getPlugin?: (channelId: string) => ChannelPluginObject | null;
   loadPlugin?: (channelId: string) => Promise<ChannelPluginObject | null>;
+  /** Override the optional SDK chunking helpers (tests simulate their absence). */
+  loadSdkChunking?: () => Promise<SdkChunking | null>;
   log?: (line: Record<string, unknown>) => void;
   now?: () => number;
 };
@@ -66,30 +107,6 @@ type ChunkerMode = "text" | "markdown";
 
 /** Worst-case width of the "[12/34]\n" prefix used when chunkPrefix is on. */
 const CHUNK_PREFIX_RESERVE = 10;
-
-// SDK helpers are typed against OpenClaw's own config/provider unions; we only
-// ever pass our built config plus a channel id string, so narrow the surface.
-const sdkChunkText = chunkTextWithMode as unknown as (
-  text: string,
-  limit: number,
-  mode: ChunkMode,
-) => string[];
-const sdkChunkMarkdown = chunkMarkdownTextWithMode as unknown as (
-  text: string,
-  limit: number,
-  mode: ChunkMode,
-) => string[];
-const sdkResolveChunkMode = resolveChunkMode as unknown as (
-  cfg: unknown,
-  provider?: string,
-  accountId?: string | null,
-) => ChunkMode;
-const sdkResolveTextChunkLimit = resolveTextChunkLimit as unknown as (
-  cfg: unknown,
-  provider?: string,
-  accountId?: string | null,
-  opts?: { fallbackLimit?: number },
-) => number;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -282,6 +299,7 @@ function resolveChunkLimit(
   cfg: Record<string, unknown>,
   channel: string,
   accountId: string,
+  sdk: SdkChunking | null,
 ): number {
   const declared = typeof outbound.textChunkLimit === "number" && outbound.textChunkLimit > 0
     ? Math.floor(outbound.textChunkLimit)
@@ -289,10 +307,12 @@ function resolveChunkLimit(
   const configured = declared ?? resolveReplyChunkSize(undefined);
 
   let limit = configured;
-  try {
-    limit = sdkResolveTextChunkLimit(cfg, channel, accountId, { fallbackLimit: configured });
-  } catch {
-    // SDK helper unavailable/failed — the declared limit is authoritative.
+  if (sdk) {
+    try {
+      limit = sdk.resolveTextChunkLimit(cfg, channel, accountId, { fallbackLimit: configured });
+    } catch {
+      // SDK helper failed for this config — the declared limit is authoritative.
+    }
   }
   if (!Number.isFinite(limit) || limit <= 0) limit = configured;
 
@@ -312,12 +332,7 @@ function resolveChunkLimit(
   return Math.max(1, Math.floor(limit));
 }
 
-function resolveAdapterChunkMode(
-  outbound: ChannelOutboundAdapterLike,
-  cfg: Record<string, unknown>,
-  channel: string,
-  accountId: string,
-): ChunkerMode {
+function resolveAdapterChunkMode(outbound: ChannelOutboundAdapterLike): ChunkerMode {
   if (outbound.chunkerMode === "markdown" || outbound.chunkerMode === "text") {
     return outbound.chunkerMode;
   }
@@ -330,6 +345,7 @@ function splitIntoChunks(
   limit: number,
   mode: ChunkerMode,
   softMode: ChunkMode,
+  sdk: SdkChunking | null,
 ): string[] {
   if (text === "") return [];
   if (Array.from(text).length <= limit) return [text];
@@ -341,13 +357,22 @@ function splitIntoChunks(
         return chunked;
       }
     } catch {
-      // Fall through to the SDK helpers.
+      // Fall through to the SDK helpers / built-in splitter.
     }
   }
 
-  return mode === "markdown"
-    ? sdkChunkMarkdown(text, limit, softMode)
-    : sdkChunkText(text, limit, softMode);
+  if (sdk) {
+    try {
+      return mode === "markdown"
+        ? sdk.chunkMarkdownTextWithMode(text, limit, softMode)
+        : sdk.chunkTextWithMode(text, limit, softMode);
+    } catch {
+      // Fall through to the built-in splitter.
+    }
+  }
+
+  // Last resort: OCG's own splitter (the one the reply path uses).
+  return splitReplyText(text, limit);
 }
 
 function withChunkPrefix(chunks: string[]): string[] {
@@ -529,23 +554,28 @@ export async function executeSend(params: {
   }
 
   // ── Chunk ───────────────────────────────────────────────────────────────
-  const chunkerMode = resolveAdapterChunkMode(outbound, cfg, channel, accountId);
+  // SDK helpers are optional (see loadSdkChunking): without them we still chunk
+  // via the plugin's own `chunker` or OCG's built-in splitter.
+  const sdk = await (deps.loadSdkChunking ?? loadSdkChunking)();
+  const chunkerMode = resolveAdapterChunkMode(outbound);
   let softMode: ChunkMode = "length";
-  try {
-    softMode = sdkResolveChunkMode(cfg, channel, accountId);
-  } catch {
-    softMode = "length";
+  if (sdk) {
+    try {
+      softMode = sdk.resolveChunkMode(cfg, channel, accountId);
+    } catch {
+      softMode = "length";
+    }
   }
 
-  let limit = resolveChunkLimit(outbound, cfg, channel, accountId);
-  let chunks = splitIntoChunks(outbound, text, limit, chunkerMode, softMode);
+  let limit = resolveChunkLimit(outbound, cfg, channel, accountId, sdk);
+  let chunks = splitIntoChunks(outbound, text, limit, chunkerMode, softMode, sdk);
 
   if (settings.chunkPrefix && chunks.length > 0) {
     // Re-chunk with the prefix width reserved so the final payload stays within
     // the channel limit (mirrors the reply path's two-pass approach).
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const reserved = Math.max(1, limit - CHUNK_PREFIX_RESERVE);
-      const next = splitIntoChunks(outbound, text, reserved, chunkerMode, softMode);
+      const next = splitIntoChunks(outbound, text, reserved, chunkerMode, softMode, sdk);
       if (next.length === chunks.length) break;
       chunks = next;
     }

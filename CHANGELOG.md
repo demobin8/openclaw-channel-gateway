@@ -4,6 +4,27 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.2.1] — 2026-09-22
+
+### Changed
+
+- Proactive send loads the OpenClaw SDK chunking helpers
+  (`openclaw/plugin-sdk/reply-chunking`) **lazily and optionally**: when a future
+  openclaw release renames or removes that entry, only proactive send degrades —
+  to the plugin's own `chunker` declaration, or failing that OCG's built-in
+  splitter — instead of every `ocg` command failing at process start. Upstream has
+  already removed one public entry this way (`plugin-sdk/outbound-runtime` is gone
+  in openclaw 2026.9.5), so the guard is not hypothetical.
+
+### Tests
+
+- `src/send-test.ts`: 5 new assertions covering the "SDK helpers unavailable"
+  path (chunking still bounded by the plugin's declared limit); 58 total.
+- `docs/requirements-proactive-send.md` §3.7.5 records the upstream removal as
+  evidence for choosing the plugin-primitive path.
+
+---
+
 ## [1.2.0] — 2026-09-21
 
 ### Added
