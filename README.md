@@ -257,6 +257,8 @@ Enable async mode in `ocg.json`:
 
 OCG sends a standard OpenAI chat completion request with a callback URL in the `X-OCG-Callback` header. Your agent processes the message (even for minutes or hours), then POSTs the reply to that callback URL.
 
+The request also carries `X-OCG-Target` — the peer the message came from, in OCG's target vocabulary (`qqbot:c2c:<openid>`, `qqbot:group:<id>`, …). The body's `user` field holds the stable session key (`<channel>:agent:main:main`), which is what replies are keyed on, but it is **not** addressable: an agent that wants to send something back later (a scheduled report, a long-task result) needs `X-OCG-Target` for that.
+
 **Callback request format** (Agent → OCG):
 
 ```json

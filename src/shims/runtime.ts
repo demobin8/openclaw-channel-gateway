@@ -464,6 +464,12 @@ async function dispatchReplyFromConfig(params: {
       "Content-Type": "application/json",
       "X-OCG-Callback": callbackUrl,
     };
+    if (from && from !== "unknown") {
+      // The peer this message came from, in the gateway's own target vocabulary
+      // (e.g. qqbot:c2c:<openid>, qqbot:group:<id>). `user` carries the session key, which the
+      // agent side cannot send back to, so a proactive send needs the target as well.
+      asyncHeaders["X-OCG-Target"] = from;
+    }
     if (apiKey) {
       asyncHeaders["Authorization"] = `Bearer ${apiKey}`;
     }
@@ -488,6 +494,9 @@ async function dispatchReplyFromConfig(params: {
   }
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (from && from !== "unknown") {
+    headers["X-OCG-Target"] = from;
+  }
   if (apiKey) {
     headers["Authorization"] = `Bearer ${apiKey}`;
   }

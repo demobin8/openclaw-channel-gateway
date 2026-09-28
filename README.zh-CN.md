@@ -257,6 +257,8 @@ ACP 模式从 IM 渠道视角看是同步请求/响应。OCG 会在多条消息�
 
 OCG 发送标准 OpenAI 格式请求，在 `X-OCG-Callback` 头中携带回调地址。你的 Agent 处理消息（即使耗时数分钟到数小时），完成后向该回调地址 POST 回复。
 
+请求同时携带 `X-OCG-Target` —— 消息来源的对端地址，使用 OCG 自己的目标格式（`qqbot:c2c:<openid>`、`qqbot:group:<id>` 等）。请求体里的 `user` 字段是稳定的**会话 key**（`<channel>:agent:main:main`），回复按它路由，但它**不可投递**：Agent 想在之后主动发消息（定时报告、长任务结果）必须用 `X-OCG-Target`。
+
 **回调请求格式**（Agent → OCG）：
 
 ```json

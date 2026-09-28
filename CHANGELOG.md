@@ -4,6 +4,20 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.2.2] — 2026-09-28
+
+### Added
+
+- `X-OCG-Target` request header: the peer the inbound message came from, in OCG's
+  own target vocabulary (`qqbot:c2c:<openid>`, `qqbot:group:<id>`, …). The body's
+  `user` field only carries the session key (`qqbot:agent:main:main`), which the
+  agent side cannot address — `/ocg/send` rejects it with
+  `INVALID_TARGET` — so an agent that wants to send something back later had no
+  way to learn a usable target. Sent on both the async and sync dispatch paths,
+  and omitted when the peer is unknown.
+
+---
+
 ## [1.2.1] — 2026-09-22
 
 ### Changed
