@@ -41,6 +41,10 @@ try {
       liteGateway: {
         agentType: "acp",
         model: "mock-acp",
+        // Block streaming must be enabled explicitly; without it the final
+        // reply is the only delivery (and the block assertions below cannot
+        // hold — this fixture was missing the flag, a pre-existing test bug).
+        acpStreamBlocks: true,
         acp: {
           command: process.execPath,
           args: [mockPath],

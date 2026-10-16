@@ -4,6 +4,86 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.3.0] — 2026-10-16
+
+### Added
+
+- **Mailbox transport** (`agentType: "mailbox"`): inbound messages are queued in
+  the daemon and pulled by short-lived CLI commands, so a coding agent in a
+  terminal can wait for, process and answer IM messages like a mail client.
+  - `ocg inbox wait` — long-poll (≤120 s) with consumer names and leases;
+    timeouts return an empty list with exit 0.
+  - `ocg reply <id>` — replies through the plugin's passive-reply handle when
+    still valid, otherwise degrades to a proactive send to the same peer
+    (`via` field in the response). `--text`, `--text-file` or `-` (stdin);
+    `--media`, `--error`.
+  - `ocg inbox list / show / ack`, `ocg targets list`.
+  - Durable queue: append-only JSONL (`<configDir>/mailbox/mailbox.jsonl`) with
+    restart replay (replayed messages are `replyable: false`), lease expiry
+    with redelivery counting, queue cap, media download from URLs, retention
+    for media + history.
+- **Agent routes** on the callback server: `GET /ocg/health`,
+  `GET /ocg/inbox(/wait|/{id})`, `POST /ocg/inbox/{id}/ack|reply`,
+  `GET /ocg/targets`. Auth via the new **local token**
+  (`<configDir>/ocg-local-token`, loopback-only under a wildcard bind) or the
+  existing HMAC signature; uniform `{ok:false, code, message, hint}` errors.
+- **Daemon control**: `ocg daemon start` (background + health polling),
+  `ocg daemon stop`, `ocg daemon status`, `ocg daemon logs [--tail --follow]`,
+  `ocg doctor`, `ocg skill install/show` (SKILL.md ships in the npm package
+  under `skills/ocg/`).
+- **Single-instance guard**: `ocg start` refuses to boot when a live daemon
+  already answers `/ocg/health`.
+- Graceful daemon shutdown: `SIGINT`/`SIGTERM` stop channels, flush state and
+  exit; `ocg-state.json` now records the bound `callbackPort` / `callbackHost`.
+
+### Changed
+
+- **`ocg stop` actually stops background daemons** — it previously only stopped
+  in-process channels (a no-op in background mode) and left the state file
+  behind. It now reads the state file and terminates the process
+  (`taskkill /T /F` on Windows, SIGTERM → SIGKILL on POSIX).
+- **`ocg send` prefers the running daemon** (`POST /ocg/send` with the local
+  token, no plugin reload, shared account state) and falls back to the
+  in-process implementation when the daemon is absent; the result carries
+  `inProcess` (true/false).
+- **`ocg status` merges `/ocg/health`** (daemon version/pid, mailbox backlog,
+  per-account channel state) when reachable.
+- **Shared inbound dispatch**: `dispatchReplyWithBufferedBlockDispatcher`
+  (telegram/discord/qqbot…) and `dispatchReplyFromConfig`
+  (openclaw-weixin…) now call one `dispatchInbound()` implementation
+  (`src/inbound.ts`) that selects mailbox / ACP / HTTP. Both entries keep their
+  previous delivery semantics exactly (final-after-blocks policy, empty-body
+  handling, `disableBlockStreaming`).
+- **State file, local token, mailbox data and logs live next to the config**
+  (`dirname(OCG_CONFIG_PATH)`), so a custom config path isolates a full
+  instance instead of only the JSON file.
+- `ocg daemon start` readiness window: accepts a healthy daemon once a channel
+  reports running, or 30 s after health first answers; gives up at `--timeout`
+  (default 120 s). A pure 30 s window mis-reported timeouts on machines where
+  cold plugin loading alone takes ~1 minute.
+
+### Fixed
+
+- `ocg stop` / `ocg restart` no longer leave the background process running
+  (see Changed).
+- `acp-dispatch-test.ts` passed `acpStreamBlocks` nowhere while asserting block
+  delivery — the test failed on the previous revision too; the fixture now
+  enables the flag it asserts on.
+
+### Tests
+
+- `src/mailbox-test.ts` (queue, leases, redelivery cap, JSONL replay, media
+  download, targets, dispatchInbound integration).
+- `src/agent-routes-test.ts` (auth incl. loopback rule, long-poll wake-up,
+  reply via handle vs degrade, `ALREADY_REPLIED`, `LEASE_HELD_BY_OTHER`,
+  `MAILBOX_DISABLED`).
+- `scripts/e2e-mailbox.ts` (`npm run test:e2e`): real CLI processes against a
+  live daemon — wait → reply → list → ack → targets → status → doctor.
+- Regression suites (`send-test`, `dispatch-test`, `acp-dispatch-test`,
+  `loader-test`) stay green; `npm test` runs them all.
+
+---
+
 ## [1.2.2] — 2026-09-28
 
 ### Added

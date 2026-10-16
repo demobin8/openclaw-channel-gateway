@@ -39,7 +39,24 @@ export type AcpGatewayConfig = {
   timeoutMs?: number;
 };
 
-export type AgentType = "http" | "acp";
+/**
+ * Agent transport type.
+ *
+ * - `http`    — OpenAI-compatible Chat Completions endpoint (default)
+ * - `acp`     — local ACP stdio agent subprocess
+ * - `mailbox` — inbound messages are queued in the daemon and pulled by a
+ *               short-lived CLI (`ocg inbox wait` / `ocg reply`); see
+ *               docs/techdesign-agent-cli.md
+ */
+export type AgentType = "http" | "acp" | "mailbox";
+
+export const AGENT_TYPES: readonly AgentType[] = ["http", "acp", "mailbox"];
+
+export function asAgentType(value: unknown): AgentType | undefined {
+  return typeof value === "string" && (AGENT_TYPES as readonly string[]).includes(value)
+    ? (value as AgentType)
+    : undefined;
+}
 
 export type LiteGatewayConfig = {
   /** Agent transport type. Defaults to "http" for backward compatibility. */
@@ -92,6 +109,21 @@ export type LiteGatewayConfig = {
   sendTimeoutMs?: number;
   /** Prefix each outbound chunk with "[i/n]" like the reply path (default false). */
   sendChunkPrefix?: boolean;
+  // ── Mailbox transport (agentType: "mailbox") ────────────────────────────
+  /** Lease duration for a pulled message in milliseconds (default 300000 = 5 min). */
+  mailboxLeaseMs?: number;
+  /** Reply-handle TTL in seconds. Falls back to callbackTokenTTL, then 1800. */
+  mailboxReplyTTL?: number;
+  /** Max queued (pending) messages; the oldest pending message is dropped beyond it (default 1000). */
+  mailboxMaxPending?: number;
+  /** Lease-expiry redeliveries before a message is marked expired (default 5). */
+  mailboxMaxRedeliveries?: number;
+  /** Download remote inbound media into the mailbox media dir (default true). */
+  mailboxDownloadMedia?: boolean;
+  /** Days to keep downloaded media (default 7). */
+  mailboxMediaRetentionDays?: number;
+  /** Days to keep done entries in the mailbox JSONL log (default 30). */
+  mailboxHistoryRetentionDays?: number;
   /** Session model (OpenClaw-compatible) */
   session?: {
     /** DM session isolation scope: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer". Defaults to "per-channel-peer". */
@@ -191,6 +223,11 @@ function positiveInt(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
+function nonNegativeInt(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
 /**
  * Resolve proactive-send settings.
  *
@@ -218,6 +255,72 @@ export function resolveSendSettings(raw: LiteGatewayConfig | null | undefined): 
     timeoutMs: positiveInt(cfg.sendTimeoutMs, DEFAULT_SEND_TIMEOUT_MS),
     chunkPrefix: cfg.sendChunkPrefix === true,
   };
+}
+
+// ── Mailbox settings ──────────────────────────────────────────────────────
+
+export const DEFAULT_MAILBOX_LEASE_MS = 5 * 60_000;
+export const DEFAULT_MAILBOX_REPLY_TTL_SECONDS = 1800;
+export const DEFAULT_MAILBOX_MAX_PENDING = 1000;
+export const DEFAULT_MAILBOX_MAX_REDELIVERIES = 5;
+export const DEFAULT_MAILBOX_MEDIA_RETENTION_DAYS = 7;
+export const DEFAULT_MAILBOX_HISTORY_RETENTION_DAYS = 30;
+
+/** Normalized mailbox settings derived from config (all optional keys). */
+export type MailboxSettings = {
+  /** Lease duration in milliseconds. */
+  leaseMs: number;
+  /** Reply-handle TTL in milliseconds. */
+  replyTtlMs: number;
+  maxPending: number;
+  maxRedeliveries: number;
+  downloadMedia: boolean;
+  mediaRetentionDays: number;
+  historyRetentionDays: number;
+};
+
+/**
+ * Resolve mailbox settings. Every key is optional; missing values fall back to
+ * the defaults listed in docs/techdesign-agent-cli.md §5.13.
+ */
+export function resolveMailboxSettings(raw?: LiteGatewayConfig | null): MailboxSettings {
+  const cfg = raw ?? {};
+  const replyTtlSeconds = positiveInt(
+    cfg.mailboxReplyTTL,
+    positiveInt(cfg.callbackTokenTTL, DEFAULT_MAILBOX_REPLY_TTL_SECONDS),
+  );
+  return {
+    leaseMs: positiveInt(cfg.mailboxLeaseMs, DEFAULT_MAILBOX_LEASE_MS),
+    replyTtlMs: replyTtlSeconds * 1000,
+    maxPending: positiveInt(cfg.mailboxMaxPending, DEFAULT_MAILBOX_MAX_PENDING),
+    maxRedeliveries: nonNegativeInt(cfg.mailboxMaxRedeliveries, DEFAULT_MAILBOX_MAX_REDELIVERIES),
+    downloadMedia: cfg.mailboxDownloadMedia !== false,
+    mediaRetentionDays: positiveInt(
+      cfg.mailboxMediaRetentionDays,
+      DEFAULT_MAILBOX_MEDIA_RETENTION_DAYS,
+    ),
+    historyRetentionDays: positiveInt(
+      cfg.mailboxHistoryRetentionDays,
+      DEFAULT_MAILBOX_HISTORY_RETENTION_DAYS,
+    ),
+  };
+}
+
+/**
+ * Whether mailbox mode is configured anywhere: the global `agentType` or any
+ * channel-level `agentType`. Used by the `/ocg/inbox*` routes to answer
+ * `MAILBOX_DISABLED` before touching the queue.
+ */
+export function isMailboxConfigured(cfg: Record<string, unknown> | null | undefined): boolean {
+  if (!cfg) return false;
+  const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
+  if (asAgentType(liteGw.agentType) === "mailbox") return true;
+  if (asAgentType(cfg.agentType) === "mailbox") return true;
+  const channels = cfg.channels as Record<string, Record<string, unknown>> | undefined;
+  if (!channels) return false;
+  return Object.values(channels).some(
+    (section) => section && typeof section === "object" && asAgentType(section.agentType) === "mailbox",
+  );
 }
 
 /**
@@ -258,8 +361,9 @@ export function resolveChannelAgentType(
 ): AgentType {
   if (channelId) {
     const chCfg = resolveChannelSection(channelId, cfg);
-    if (chCfg?.agentType === "acp" || chCfg?.agentType === "http") {
-      return chCfg.agentType;
+    const channelType = asAgentType(chCfg?.agentType);
+    if (channelType) {
+      return channelType;
     }
     if (chCfg?.acp && typeof chCfg.acp === "object") {
       return "acp";
@@ -267,13 +371,15 @@ export function resolveChannelAgentType(
   }
 
   const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
-  if (liteGw.agentType === "acp" || liteGw.agentType === "http") {
-    return liteGw.agentType;
+  const globalType = asAgentType(liteGw.agentType);
+  if (globalType) {
+    return globalType;
   }
   if (liteGw.acp && typeof liteGw.acp === "object") {
     return "acp";
   }
-  if (process.env.OCG_AGENT_TYPE === "acp") return "acp";
+  const envType = asAgentType(process.env.OCG_AGENT_TYPE);
+  if (envType) return envType;
   return "http";
 }
 

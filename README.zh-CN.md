@@ -67,10 +67,11 @@ npm install -g openclaw-channel-gateway
 
 ### 渠道级 Agent 传输方式
 
-OCG 支持两种 Agent 传输方式：
+OCG 支持三种 Agent 传输方式：
 
 - `http` — OpenAI 兼容 Chat Completions 端点。HTTP 模式可将 SSE 流式响应逐块投递到 IM 渠道。
 - `acp` — 本地 ACP stdio Agent 子进程。ACP 模式会保持一个长期运行的子进程，并按 IM 会话复用 ACP session；默认会缓冲流式 delta，只向 IM 发送一条最终回复。
+- `mailbox` — 入站消息进入 daemon 队列，由**短命令 CLI 主动拉取**（`ocg inbox wait` / `ocg reply`），面向在终端里运行的编程 Agent。见 [Mailbox 模式](#mailbox-模式agent-cli)。
 
 每个渠道可以覆盖全局 `agentType`、`agentUrl` 和 `acp` 配置。如果渠道没有配置覆盖项，则回退到全局配置。
 
@@ -165,10 +166,16 @@ ocg start
 |---|---|
 | `ocg start` | 前台启动所有已启用的渠道 |
 | `ocg start --background` / `ocg start -d` | 以 detached 后台进程启动所有已启用的渠道 |
-| `ocg start --log-file [--log-dir <dir>]` | 将启动日志写入文件（默认：`~/.openclaw-channel-gateway/ocg.logs/`） |
-| `ocg stop` | 停止所有渠道 |
-| `ocg restart` | 重启所有渠道 |
-| `ocg status` | 查看网关状态，包括后台启动的渠道 |
+| `ocg start --log-file [--log-dir <dir>]` | 将启动日志写入文件（默认：`<configDir>/ocg.logs/`） |
+| `ocg stop` | 停止网关（存在后台 daemon 进程时结束该进程） |
+| `ocg restart` | 重启网关 |
+| `ocg status` | 查看网关状态；daemon 可达时合并健康信息 |
+| `ocg daemon start\|stop\|status\|logs` | daemon 控制：启动（后台 + 健康轮询）、停止、健康/队列状态、日志（`--tail`、`--follow`） |
+| `ocg inbox wait\|list\|show\|ack` | Mailbox：拉取 / 查看 / 结束队列消息（mailbox 模式） |
+| `ocg reply <id> (--text <t> \| --text-file <f> \| -) [--media <url>] [--error]` | 回复一条拉取到的消息（`-` 从 stdin 读取） |
+| `ocg targets list` | 最近出现过的发送目标（mailbox 模式） |
+| `ocg doctor [--json]` | 诊断配置、daemon、本地 token、渠道与队列积压 |
+| `ocg skill install\|show` | 安装 / 打印 Agent 的 SKILL.md（`~/.claude/skills/ocg/`、`./.agents/skills/ocg/`） |
 | `ocg send --channel <id> --to <目标> --text <文本>` | 主动发送消息到指定渠道目标（见[主动发送](#主动发送)） |
 | `ocg test` | 运行 dispatch 冒烟测试 |
 | `ocg version` | 显示版本号 |
@@ -347,7 +354,7 @@ ocg send --channel qqbot --to qqbot:c2c:OPENID --media-url https://example.com/x
 
 退出码：`0` 成功 / `1` 平台失败（含超时）/ `2` 参数错误 / `3` 未启用、未就绪或无 outbound 适配器。
 
-`ocg send` 是独立进程、按需加载插件，因此**不要求** gateway 正在运行；但它与网关进程**不共享内存态**（账号运行态、插件内部限流计数），需要与在线网关协同的投递请优先走 HTTP 端点。
+`ocg send` 优先走运行中的 daemon（`POST /ocg/send`，用本地 token 鉴权，插件已加载、账号运行态共享）；daemon 不在时回退到进程内实现（按需加载插件，可独立工作）。JSON 输出用 `inProcess: true/false` 标明本次由哪条路径完成。
 
 ### 投递语义
 
@@ -370,6 +377,67 @@ ocg send --channel qqbot --to qqbot:c2c:OPENID --media-url https://example.com/x
 
 ---
 
+## Mailbox 模式（Agent CLI）
+
+`agentType: "mailbox"` 把回复链路反转：OCG 不再把消息推给 Agent 端点，而是把入站消息**排入 daemon 队列**，由短命令 CLI 主动拉取。它面向终端里的编程 Agent（Claude Code、Codex、OpenCode 等），用几条 shell 命令完成「等消息 → 处理 → 回复」的循环。
+
+```bash
+# 终端 A —— daemon（渠道 + 队列 + 回调服务器）
+ocg daemon start
+
+# 终端 B（或 Agent 自己）
+ocg inbox wait --timeout 60 --json      # 阻塞等待；超时返回 []、退出码 0
+ocg reply m_abc123 --text "收到，处理中" --json
+echo "长回复内容" | ocg reply m_abc123 - --json
+```
+
+Agent 可以安装随包发布的技能文件（`SKILL.md`），让模型无需人工讲解就知道整套循环、消息结构与平台陷阱：
+
+```bash
+ocg skill install          # 写入 ~/.claude/skills/ocg/（存在 ./.agents/ 时同时写入其下）
+ocg skill show             # 打印同一内容
+```
+
+### 命令
+
+| 命令 | 行为 |
+|---|---|
+| `ocg inbox wait [--timeout 60] [--channel <id>] [--consumer <name>] [--max N] [--peek]` | 长轮询拉取消息（≤120 秒）。消息被取走即持有**租约**（默认 5 分钟）；并行 Agent 用 `--consumer` 区分。无消息 → 空数组、退出码 0。 |
+| `ocg reply <id> --text <t>` / `--text-file <f>` / `-` | 回复。优先使用插件的被动回复句柄；句柄过期（或 daemon 重启）后降级为对同一对端的主动发送 — 响应里的 `via` 字段标明 `"reply"` 或 `"send"`。一条消息只能回复一次（否则 `ALREADY_REPLIED`）。 |
+| `ocg inbox list [--state pending,leased,done,all] [--limit N]` | 查看队列（默认 `pending,leased`，按时间倒序）。 |
+| `ocg inbox show <id>` | 单条详情（含媒体路径；媒体可能仍在下载中）。 |
+| `ocg inbox ack <id> [--force]` | 不回复直接结束。`--force` 可打断他人的租约（供人工处理）。 |
+| `ocg targets list` | 最近出现过的对端 — 即 `ocg send` 可用的 `target` 值。 |
+
+### 配置（全部可选）
+
+```jsonc
+{
+  "agentType": "mailbox",              // 全局，或按渠道：channels.<id>.agentType
+  "mailboxLeaseMs": 300000,            // 单条消息的租约时长
+  "mailboxReplyTTL": 1800,             // 被动回复窗口（秒；缺省沿用 callbackTokenTTL）
+  "mailboxMaxPending": 1000,           // 队列上限（超出时丢弃最老的 pending）
+  "mailboxMaxRedeliveries": 5,         // 租约超时重投次数，超过后置为 expired
+  "mailboxDownloadMedia": true,        // 把远端媒体 URL 下载到 <configDir>/mailbox/media/
+  "mailboxMediaRetentionDays": 7,
+  "mailboxHistoryRetentionDays": 30    // JSONL 日志保留天数
+}
+```
+
+队列会镜像到追加写 JSONL；daemon 重启后未完成的消息重新入队（重放消息不再 `replyable`，回复将走 `send` 降级路径）。
+
+### HTTP 接口
+
+CLI 的每个动作都有对应的 HTTP 路由（与 `/ocg/send` 同端口）：`GET /ocg/health`、`/ocg/inbox`、`/ocg/inbox/wait`、`/ocg/inbox/{id}`、`POST /ocg/inbox/{id}/ack|reply`、`GET /ocg/targets`。鉴权用本地 token（daemon 启动时生成于 `<configDir>/ocg-local-token`；绑定 `0.0.0.0` 时仅接受回环地址）或原有的 `X-OCG-Signature` HMAC。
+
+### 退出码（inbox/reply）
+
+`0` 成功（`wait` 超时也是 0）· `1` 投递失败（`PLATFORM_SEND_FAILED`、`REPLY_EXPIRED`、`ALREADY_REPLIED`、租约冲突）· `2` 参数错误 / 未知 id · `3` daemon 未运行、鉴权失败或能力关闭（`DISABLED`、`MAILBOX_DISABLED`）。
+
+> QQ 说明：在被动回复窗口内回复走插件的回复通道，不受主动消息窗口限制 — 这正是 `reply` 优先用句柄、仅在句柄失效时才降级 `send` 的原因。
+
+---
+
 ## 开发
 
 ```bash
@@ -382,6 +450,12 @@ npm run build
 # 生产运行
 npm start
 
-# 主动发送冒烟测试（mock 插件 + 真实 HTTP 路由）
+# 单元 / 回归测试（send、dispatch、acp、loader、mailbox、agent routes）
+npm test
+
+# 端到端：真实 CLI 进程对真实 daemon
+npm run test:e2e
+
+# 仅主动发送冒烟测试（mock 插件 + 真实 HTTP 路由）
 npx tsx src/send-test.ts
 ```

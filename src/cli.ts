@@ -31,12 +31,32 @@ import {
   listConfiguredChannels,
   listAllChannels,
   resolveConfigPath,
-  resolveConfigDir,
   saveConfig,
 } from "./index.js";
-import { applyConfigEnvOverrides, resolveSendSettings } from "./config.js";
+import { applyConfigEnvOverrides, isMailboxConfigured, resolveSendSettings } from "./config.js";
 import { executeSend } from "./send-service.js";
 import { startCallbackServer, isCallbackServerRunning } from "./callback-server.js";
+import { ensureLocalToken, resolveLocalTokenPath } from "./local-auth.js";
+import {
+  DEFAULT_DAEMON_HOST,
+  daemonRequest,
+  probeDaemonHealth,
+  resolveDaemonEndpoint,
+  type DaemonResponse,
+} from "./daemon-client.js";
+import {
+  followLogFile,
+  latestLogFile,
+  readLastLines,
+  resolveDaemonLogDir,
+  stopDaemonProcess,
+} from "./daemon-control.js";
+import { buildSkillMarkdown } from "./skill-template.js";
+import {
+  clearGatewayProcessState,
+  isProcessRunning,
+  readGatewayProcessState,
+} from "./process-state.js";
 import {
   startChannel,
   stopChannel,
@@ -53,9 +73,10 @@ import {
   channelLoginWait,
 } from "./plugin-loader.js";
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 function readPackageVersion(): string {
@@ -90,14 +111,31 @@ function printHelp(): void {
   console.log("");
   console.log("Commands:");
   console.log("  start [--background|-d] [--log-file] [--log-dir <dir>]  Start all enabled channels");
-  console.log("  stop                          Stop all channels");
-  console.log("  restart                       Restart all channels");
-  console.log("  status                        Show gateway status");
+  console.log("  stop                          Stop the gateway (background daemon included)");
+  console.log("  restart                       Restart the gateway");
+  console.log("  status                        Show gateway status (merges daemon health)");
   console.log("  chat [message] [--interactive|-i]  Send terminal input through HTTP/ACP dispatch");
   console.log("                                Options: --channel <id>, --agent-type <http|acp>, --agent-url <url>, --acp-command <cmd>");
   console.log("  send --channel <id> --to <target> --text <text>");
   console.log("       [--account <id>] [--media-url <url>] [--reply-to <messageId>] [--chunk-prefix] [--json]");
   console.log("                                Proactively send a message to a channel target");
+  console.log("");
+  console.log("  daemon start [--log-dir <dir>] [--timeout <sec>] [--json]  Start the background daemon (polls health)");
+  console.log("  daemon stop [--timeout <sec>] [--json]      Stop the background daemon");
+  console.log("  daemon status [--json]                      Daemon health / channels / mailbox");
+  console.log("  daemon logs [--tail <n>] [--follow]         Show the newest daemon log");
+  console.log("");
+  console.log("  inbox wait [--timeout <sec>] [--channel <id>] [--consumer <name>] [--max <n>] [--peek] [--json]");
+  console.log("                                Pull queued messages (agentType: \"mailbox\")");
+  console.log("  inbox list [--state pending|leased|done|all] [--limit <n>] [--channel <id>] [--json]");
+  console.log("  inbox show <id> [--json]                    Full message detail (incl. media paths)");
+  console.log("  inbox ack <id> [--force] [--consumer <name>]  Finish without replying");
+  console.log("  reply <id> (--text <t> | --text-file <f> | -) [--media <url>] [--error] [--json]");
+  console.log("                                Reply to a pulled message ('-' reads stdin)");
+  console.log("  targets list [--channel <id>] [--json]      Recently seen send targets");
+  console.log("");
+  console.log("  doctor [--json]               Diagnose config, daemon, token, channels");
+  console.log("  skill install|show [--dir <path>] [--force]  Install/print the agent SKILL.md");
   console.log("  test                          Run dispatch smoke test");
   console.log("  version                       Print version");
   console.log("  upgrade [--package-manager <pm>] [--target <version>] [--local] [--dry-run]");
@@ -120,7 +158,7 @@ function printHelp(): void {
   console.log("");
   console.log("Environment:");
   console.log("  OCG_CONFIG_PATH     Config file path");
-  console.log("  OCG_AGENT_TYPE      Agent transport: http or acp");
+  console.log("  OCG_AGENT_TYPE      Agent transport: http, acp or mailbox");
   console.log("  OCG_AGENT_URL       Agent API URL (HTTP mode)");
   console.log("  OCG_ACP_COMMAND     ACP binary (ACP mode)");
   console.log("  OCG_ACP_ARGS        ACP args as JSON array (ACP mode)");
@@ -128,6 +166,9 @@ function printHelp(): void {
   console.log("  OCG_MODEL           Model name");
   console.log("  OCG_API_KEY         API key");
   console.log("  OCG_TELEGRAM_TOKEN  Telegram bot token");
+  console.log("  OCG_CONSUMER        Default inbox consumer name (default \"default\")");
+  console.log("  OCG_DAEMON_URL      Override daemon endpoint discovery");
+  console.log("  OCG_AUTO_START      =1 lets inbox/reply auto-start the daemon");
 }
 
 // ── Arg parser (simple positional + flags, no Commander dependency) ────────
@@ -271,7 +312,7 @@ function shouldWriteStartLogsToFile(args: Args): boolean {
 function resolveStartLogDir(args: Args): string {
   const logDir = args["log-dir"];
   if (typeof logDir === "string" && logDir.trim()) return resolve(logDir);
-  return join(resolveConfigDir(), "ocg.logs");
+  return resolveDaemonLogDir();
 }
 
 function shouldStartInBackground(args: Args): boolean {
@@ -372,7 +413,61 @@ function startGatewayInBackground(args: Args): void {
   console.log(`[ocg] Logs: ${logPath}`);
 }
 
+/**
+ * Spawn a detached daemon ("start --log-file", optional --log-dir).
+ * Used by `ocg daemon start`; the args list is built explicitly so the child
+ * never sees the `daemon start` command itself (which would recurse).
+ */
+function spawnDaemonProcess(args: Args): { pid: number; logPath: string } {
+  const logPath = createStartLogPath(resolveStartLogDir(args));
+  const out = openSync(logPath, "a");
+  const err = openSync(logPath, "a");
+  const childArgs = ["start", "--log-file"];
+  if (typeof args["log-dir"] === "string") childArgs.push("--log-dir", String(args["log-dir"]));
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1], ...childArgs], {
+    cwd: process.cwd(),
+    detached: true,
+    env: process.env,
+    stdio: ["ignore", out, err],
+  });
+  child.unref();
+  closeSync(out);
+  closeSync(err);
+  return { pid: child.pid ?? 0, logPath };
+}
+
+let shutdownHandlersInstalled = false;
+
+/** Graceful shutdown for foreground/background daemons (§5.8). */
+function installShutdownHandlers(): void {
+  if (shutdownHandlersInstalled) return;
+  shutdownHandlersInstalled = true;
+  const shutdown = (signal: NodeJS.Signals): void => {
+    console.log(`[ocg] ${signal} received — stopping gateway...`);
+    const forced = setTimeout(() => process.exit(0), 8000);
+    forced.unref?.();
+    void stopGateway()
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  };
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+/** §5.8 single-instance guard: refuse to start when a live daemon answers health. */
+async function refuseIfDaemonRunning(): Promise<void> {
+  const health = await probeDaemonHealth(resolveDaemonEndpoint(), 1500);
+  if (!health) return;
+  console.error(
+    `[ocg] Gateway already running (pid ${String(health.pid ?? "?")}). ` +
+    `Use "ocg stop" or "ocg daemon stop" first.`,
+  );
+  process.exit(3);
+}
+
 async function cmdStart(args: Args = {}): Promise<void> {
+  await refuseIfDaemonRunning();
+
   if (shouldStartInBackground(args)) {
     startGatewayInBackground(args);
     return;
@@ -380,11 +475,13 @@ async function cmdStart(args: Args = {}): Promise<void> {
 
   if (shouldWriteStartLogsToFile(args)) {
     await runWithConsoleLogFile(resolveStartLogDir(args), startGateway);
+    installShutdownHandlers();
     return;
   }
 
   try {
     await startGateway();
+    installShutdownHandlers();
   } catch (err) {
     console.error("Error:", (err as Error).message);
     process.exit(1);
@@ -392,33 +489,75 @@ async function cmdStart(args: Args = {}): Promise<void> {
 }
 
 async function cmdStop(): Promise<void> {
+  const state = readGatewayProcessState();
+  if (state && isProcessRunning(state.pid)) {
+    const result = await stopDaemonProcess(state.pid, 15_000);
+    if (!result.stopped) {
+      console.error(`[ocg] Failed to stop pid ${state.pid}: ${result.detail}`);
+      process.exitCode = 1;
+      return;
+    }
+    clearGatewayProcessState(state.pid);
+    console.log(`[ocg] Stopped (pid ${state.pid}, ${result.detail})`);
+    return;
+  }
+  if (state) clearGatewayProcessState(state.pid);
   await stopGateway();
   console.log("[ocg] Stopped");
 }
 
-async function cmdRestart(): Promise<void> {
-  await stopGateway();
-  await cmdStart();
+async function cmdRestart(args: Args = {}): Promise<void> {
+  await cmdStop();
+  await cmdStart(args);
 }
 
-function cmdStatus(args: Args = {}): void {
-  const s = gatewayStatus();
+async function cmdStatus(args: Args = {}): Promise<void> {
+  const s = gatewayStatus() as Record<string, unknown>;
+
+  // Merge the daemon's /ocg/health view when reachable (§5.7).
+  const endpoint = resolveDaemonEndpoint();
+  const health = await probeDaemonHealth(endpoint, 1500);
+  const daemonInfo = health
+    ? {
+        reachable: true,
+        baseUrl: endpoint.baseUrl,
+        version: health.version,
+        pid: health.pid,
+        uptimeMs: health.uptimeMs,
+        mailbox: health.mailbox,
+        healthChannels: health.channels,
+      }
+    : { reachable: false, baseUrl: endpoint.baseUrl, hint: "run: ocg daemon start" };
+
   if (args["json"]) {
-    console.log(JSON.stringify(s, null, 2));
+    console.log(JSON.stringify({ ...s, daemon: daemonInfo }, null, 2));
+    return;
+  }
+
+  console.log(`Agent type: ${String(s.agentType ?? "http")}`);
+  console.log(`Agent:  ${String(s.agentUrl)}`);
+  console.log(`Model:  ${String(s.model)}`);
+  console.log(`Channels configured: ${String(s.configured)}, running: ${String(s.running)}`);
+  const channels = s.channels as Array<Record<string, unknown>>;
+  for (const c of channels) {
+    const uptime = typeof c.uptime === "number" ? `${c.uptime}s` : "—";
+    const chAgentUrl = c.agentUrl as string | undefined;
+    const agentInfo = chAgentUrl && chAgentUrl !== s.agentUrl
+      ? `  agent: ${chAgentUrl}`
+      : "";
+    console.log(`  ${c.id}  ${c.status}  uptime: ${uptime}${agentInfo}`);
+  }
+  if (health) {
+    const mailbox = (health.mailbox ?? {}) as Record<string, unknown>;
+    console.log(
+      `Daemon: running (pid ${String(health.pid ?? "?")}, port ${endpoint.port}, v${String(health.version ?? "?")})`,
+    );
+    console.log(
+      `Mailbox: ${mailbox.enabled === true ? "enabled" : "disabled"}` +
+      ` (pending ${String(mailbox.pending ?? 0)}, leased ${String(mailbox.leased ?? 0)})`,
+    );
   } else {
-    console.log(`Agent type: ${s.agentType ?? "http"}`);
-    console.log(`Agent:  ${s.agentUrl}`);
-    console.log(`Model:  ${s.model}`);
-    console.log(`Channels configured: ${s.configured}, running: ${s.running}`);
-    const channels = s.channels as Array<Record<string, unknown>>;
-    for (const c of channels) {
-      const uptime = typeof c.uptime === "number" ? `${c.uptime}s` : "—";
-      const chAgentUrl = c.agentUrl as string | undefined;
-      const agentInfo = chAgentUrl && chAgentUrl !== s.agentUrl
-        ? `  agent: ${chAgentUrl}`
-        : "";
-      console.log(`  ${c.id}  ${c.status}  uptime: ${uptime}${agentInfo}`);
-    }
+    console.log("Daemon: not reachable (run: ocg daemon start)");
   }
 }
 
@@ -558,9 +697,12 @@ async function cmdChat(command: string, args: Args): Promise<void> {
 /**
  * `ocg send` — proactive send from the CLI.
  *
- * Runs in its own process: it loads the channel plugin on demand (the injected
- * plugin runtime is required by e.g. `outbound.chunker`) and does NOT share
- * in-memory state with a running gateway — see requirements doc FR-2.
+ * Prefers the running daemon (`POST /ocg/send` with the local token): the
+ * daemon already has every plugin (and its runtime) loaded, so this avoids the
+ * 1–3 s plugin load and shares account runtime state.  Falls back to the
+ * in-process implementation when the daemon is not running (or when
+ * `--chunk-prefix` overrides config the HTTP contract cannot carry) and marks
+ * the result with `inProcess: true`.
  *
  * Exit codes: 0 ok / 1 platform failure / 2 bad arguments / 3 disabled,
  * not-ready or no outbound adapter.
@@ -576,6 +718,9 @@ function sendExitCode(code: unknown): number {
     case "NOT_READY":
     case "NO_OUTBOUND_ADAPTER":
     case "INTERNAL_ERROR":
+    case "UNAUTHORIZED":
+    case "DAEMON_NOT_RUNNING":
+    case "MAILBOX_DISABLED":
       return 3;
     default:
       return 2;
@@ -590,9 +735,10 @@ async function cmdSend(args: Args): Promise<void> {
     } else if (body.ok === true) {
       const messageId = body.messageId ? `, messageId=${body.messageId}` : "";
       const degraded = body.degraded === true ? ", degraded" : "";
+      const via = body.inProcess === true ? ", in-process" : "";
       console.log(
         `[ocg] sent to ${String(body.to)} (channel=${String(body.channel)}, ` +
-        `chunks=${String(body.chunks)}${messageId}${degraded}, ${String(body.elapsedMs)}ms)`,
+        `chunks=${String(body.chunks)}${messageId}${degraded}${via}, ${String(body.elapsedMs)}ms)`,
       );
     } else {
       const partial = body.partial === true
@@ -644,6 +790,34 @@ async function cmdSend(args: Args): Promise<void> {
     return;
   }
 
+  // ── Daemon-first path ────────────────────────────────────────────────────
+  // `--chunk-prefix` is a CLI-only override the /ocg/send contract cannot
+  // express, so it keeps using the in-process implementation.
+  if (args["chunk-prefix"] !== true) {
+    const response = await daemonRequest(resolveDaemonEndpoint(), "POST", "/ocg/send", {
+      body: { channel, to, text, mediaUrl, accountId, replyToId },
+      timeoutMs: settings.timeoutMs + 5_000,
+    });
+    if (response.ok) {
+      process.exitCode = emit({ ...response.body, inProcess: false }, sendExitCode(response.body.code));
+      return;
+    }
+    if (response.code !== "DAEMON_NOT_RUNNING") {
+      process.exitCode = emit(
+        {
+          ok: false,
+          code: response.code,
+          message: response.message,
+          ...(response.hint ? { hint: response.hint } : {}),
+          inProcess: false,
+        },
+        sendExitCode(response.code),
+      );
+      return;
+    }
+    // Daemon not running → the in-process fallback below keeps working.
+  }
+
   applyConfigEnvOverrides(rawCfg);
   const cfg = buildOpenClawConfig(rawCfg);
 
@@ -655,10 +829,10 @@ async function cmdSend(args: Args): Promise<void> {
       settings,
       request: { channel, to, text, mediaUrl, accountId, replyToId },
     });
-    process.exitCode = emit(outcome.body, sendExitCode(outcome.body.code));
+    process.exitCode = emit({ ...outcome.body, inProcess: true }, sendExitCode(outcome.body.code));
   } catch (err) {
     process.exitCode = emit(
-      { ok: false, code: "INTERNAL_ERROR", message: (err as Error).message },
+      { ok: false, code: "INTERNAL_ERROR", message: (err as Error).message, inProcess: true },
       3,
     );
   }
@@ -718,8 +892,14 @@ async function cmdChannelsStart(args: Args): Promise<void> {
   }
   applyConfigEnvOverrides(rawCfg);
 
-  // Start callback server for async dispatch (only if not already running)
+  // Start callback server for async dispatch (only if not already running).
+  // Prepare the local token first so agent routes are reachable by the CLI.
   if (!isCallbackServerRunning()) {
+    try {
+      ensureLocalToken();
+    } catch (err) {
+      console.warn(`[ocg] Failed to prepare local token: ${(err as Error).message}`);
+    }
     const cbHost = rawCfg.callbackHost ?? "0.0.0.0";
     const cbPort = rawCfg.callbackPort ?? 3457;
     try {
@@ -1158,6 +1338,699 @@ async function cmdPluginsList(): Promise<void> {
   console.log("To add a channel: ocg channels add --channel <id> [--account <id>] [--<key> <value> ...]");
 }
 
+// ── Daemon & mailbox commands (§5.7) ──────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function autoStartEnabled(args: Args): boolean {
+  return args["auto-start"] === true || process.env.OCG_AUTO_START === "1";
+}
+
+type DaemonStartResult = {
+  ok: boolean;
+  pid?: number;
+  port: number;
+  channels: unknown[];
+  logPath: string;
+};
+
+/**
+ * Spawn the daemon in the background and poll `/ocg/health` until ready.
+ *
+ * Readiness (design §5.8, adjusted for real cold-start cost): accept a healthy
+ * daemon once a channel reports running, or — channel logins / plugin loads
+ * can take far longer than a fresh boot suggests — once health has been up for
+ * at least 30 s; give up at `waitMs` (default 120 s).  Plugin loading alone can
+ * exceed a minute on a cold cache, so a pure 30 s window mis-reports success
+ * on slow machines (observed: ~73 s to first health).
+ */
+async function startDaemonAndWait(args: Args, waitMs = 120_000): Promise<DaemonStartResult> {
+  const startedAt = Date.now();
+  const { pid, logPath } = spawnDaemonProcess(args);
+  let health: Record<string, unknown> | null = null;
+
+  while (Date.now() - startedAt < waitMs) {
+    await sleep(500);
+    const probe = await probeDaemonHealth(resolveDaemonEndpoint(), 2000);
+    if (!probe) continue;
+    health = probe;
+    const channels = Array.isArray(probe.channels) ? (probe.channels as Array<Record<string, unknown>>) : [];
+    const anyRunning = channels.some((channel) => channel.status === "running");
+    if (anyRunning || Date.now() - startedAt >= 30_000) break;
+  }
+  if (!health) health = await probeDaemonHealth(resolveDaemonEndpoint(), 2000);
+
+  return {
+    ok: health !== null,
+    pid: typeof health?.pid === "number" ? (health.pid as number) : pid,
+    port: resolveDaemonEndpoint().port,
+    channels: Array.isArray(health?.channels) ? (health?.channels as unknown[]) : [],
+    logPath,
+  };
+}
+
+async function cmdDaemonStart(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const existing = await probeDaemonHealth(resolveDaemonEndpoint(), 1500);
+  if (existing) {
+    const body = {
+      ok: false,
+      code: "ALREADY_RUNNING",
+      message: `daemon already running (pid ${String(existing.pid ?? "?")})`,
+      hint: "use: ocg daemon status",
+    };
+    if (json) console.log(JSON.stringify(body, null, 2));
+    else console.log(`[ocg] ${body.message}`);
+    process.exitCode = 3;
+    return;
+  }
+
+  const timeoutRaw = typeof args.timeout === "string" ? Number.parseInt(args.timeout, 10) : 120;
+  const waitMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.min(timeoutRaw, 600) * 1000 : 120_000;
+
+  const result = await startDaemonAndWait(args, waitMs);
+  if (result.ok) {
+    const body = { ok: true, pid: result.pid, port: result.port, channels: result.channels };
+    if (json) console.log(JSON.stringify(body, null, 2));
+    else console.log(`[ocg] Daemon ready (pid ${result.pid}, port ${result.port}). Logs: ${result.logPath}`);
+    return;
+  }
+  const body = {
+    ok: false,
+    code: "START_TIMEOUT",
+    message: `daemon did not answer /ocg/health within ${Math.round(waitMs / 1000)}s`,
+    hint: `check the logs: ${result.logPath}`,
+  };
+  if (json) console.log(JSON.stringify(body, null, 2));
+  else console.error(`[ocg] ${body.message}\n[ocg] ${body.hint}`);
+  process.exitCode = 3;
+}
+
+async function cmdDaemonStop(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const timeoutRaw = typeof args.timeout === "string" ? Number.parseInt(args.timeout, 10) : 10;
+  const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0
+    ? Math.min(timeoutRaw, 300) * 1000
+    : 10_000;
+
+  const state = readGatewayProcessState();
+  if (!state || !isProcessRunning(state.pid)) {
+    if (state) clearGatewayProcessState(state.pid);
+    const body = { ok: true, stopped: false, message: "daemon is not running" };
+    if (json) console.log(JSON.stringify(body, null, 2));
+    else console.log("[ocg] Daemon is not running.");
+    return;
+  }
+
+  const result = await stopDaemonProcess(state.pid, timeoutMs);
+  if (result.stopped) {
+    clearGatewayProcessState(state.pid);
+    const body = { ok: true, stopped: true, pid: state.pid, detail: result.detail };
+    if (json) console.log(JSON.stringify(body, null, 2));
+    else console.log(`[ocg] Daemon stopped (pid ${state.pid}, ${result.detail}).`);
+    return;
+  }
+  const body = { ok: false, code: "STOP_TIMEOUT", message: result.detail };
+  if (json) console.log(JSON.stringify(body, null, 2));
+  else console.error(`[ocg] Failed to stop daemon: ${result.detail}`);
+  process.exitCode = 1;
+}
+
+async function cmdDaemonStatus(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const endpoint = resolveDaemonEndpoint();
+  const health = await probeDaemonHealth(endpoint, 2500);
+  if (health) {
+    const body = { ok: true, reachable: true, baseUrl: endpoint.baseUrl, ...health };
+    if (json) console.log(JSON.stringify(body, null, 2));
+    else {
+      console.log(`Daemon:  running (pid ${String(health.pid ?? "?")}, ${endpoint.baseUrl}, v${String(health.version ?? "?")})`);
+      console.log(`Mailbox: ${(health.mailbox as Record<string, unknown> | undefined)?.enabled === true ? "enabled" : "disabled"} (pending: ${String((health.mailbox as Record<string, unknown> | undefined)?.pending ?? 0)})`);
+      const channels = Array.isArray(health.channels) ? (health.channels as Array<Record<string, unknown>>) : [];
+      for (const channel of channels) {
+        console.log(`  ${String(channel.id)}/${String(channel.accountId ?? "-")}  ${String(channel.status)}`);
+      }
+    }
+    return;
+  }
+
+  const state = readGatewayProcessState();
+  const body = {
+    ok: false,
+    reachable: false,
+    code: "DAEMON_NOT_RUNNING",
+    baseUrl: endpoint.baseUrl,
+    ...(state
+      ? {
+          statePid: state.pid,
+          stateAlive: isProcessRunning(state.pid),
+          startedAt: state.startedAt,
+          callbackPort: state.callbackPort,
+        }
+      : {}),
+    hint: "run: ocg daemon start",
+  };
+  if (json) console.log(JSON.stringify(body, null, 2));
+  else console.error(`[ocg] Daemon not reachable at ${endpoint.baseUrl}\n[ocg] ${body.hint}`);
+  process.exitCode = 3;
+}
+
+async function cmdDaemonLogs(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const tailRaw = typeof args.tail === "string" ? Number.parseInt(args.tail, 10) : 100;
+  const tailCount = Number.isFinite(tailRaw) && tailRaw > 0 ? Math.min(tailRaw, 5000) : 100;
+  const follow = args.follow === true || args.f === true;
+
+  const file = latestLogFile();
+  if (!file) {
+    if (json) console.log(JSON.stringify({ ok: true, file: null, lines: [] }, null, 2));
+    else console.log(`[ocg] No logs yet in ${resolveDaemonLogDir()}`);
+    return;
+  }
+
+  const lines = readLastLines(file, tailCount);
+  if (json && !follow) {
+    console.log(JSON.stringify({ ok: true, file, lines }, null, 2));
+    return;
+  }
+  if (json) console.log(JSON.stringify({ ok: true, file, lines }, null, 2));
+  else {
+    for (const line of lines) console.log(line);
+  }
+
+  if (follow) {
+    if (!json) console.log(`\n[ocg] Following ${file} (Ctrl+C to stop)\n`);
+    let stopped = false;
+    process.once("SIGINT", () => {
+      stopped = true;
+    });
+    await followLogFile(file, (text) => process.stdout.write(text), () => stopped);
+  }
+}
+
+async function cmdDaemon(command: string, args: Args): Promise<void> {
+  const sub = command.split(/\s+/)[1];
+  switch (sub) {
+    case "start": return cmdDaemonStart(args);
+    case "stop": return cmdDaemonStop(args);
+    case "status": return cmdDaemonStatus(args);
+    case "logs": return cmdDaemonLogs(args);
+    default:
+      console.error("Usage: ocg daemon <start|stop|status|logs>");
+      process.exitCode = 2;
+  }
+}
+
+/** Run a "must" mailbox command, honouring --auto-start / OCG_AUTO_START. */
+async function daemonCall(
+  args: Args,
+  method: "GET" | "POST",
+  path: string,
+  options: { body?: unknown; timeoutMs?: number } = {},
+): Promise<DaemonResponse> {
+  let response = await daemonRequest(resolveDaemonEndpoint(), method, path, options);
+  if (!response.ok && response.code === "DAEMON_NOT_RUNNING" && autoStartEnabled(args)) {
+    console.error("[ocg] daemon not running — starting it (--auto-start)...");
+    const started = await startDaemonAndWait(args);
+    if (started.ok) {
+      response = await daemonRequest(resolveDaemonEndpoint(), method, path, options);
+    }
+  }
+  return response;
+}
+
+function queryExitCode(code: string): number {
+  switch (code) {
+    case "INVALID_REQUEST":
+    case "NOT_FOUND":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+function replyExitCode(code: string): number {
+  switch (code) {
+    case "PLATFORM_SEND_FAILED":
+    case "REPLY_EXPIRED":
+    case "ALREADY_REPLIED":
+    case "LEASE_HELD_BY_OTHER":
+    case "DELIVER_FAILED":
+      return 1;
+    case "DAEMON_NOT_RUNNING":
+    case "UNAUTHORIZED":
+    case "MAILBOX_DISABLED":
+    case "DISABLED":
+    case "NOT_READY":
+    case "NO_OUTBOUND_ADAPTER":
+    case "INTERNAL_ERROR":
+      return 3;
+    default:
+      return 2;
+  }
+}
+
+function ackExitCode(code: string): number {
+  switch (code) {
+    case "NOT_FOUND":
+    case "INVALID_REQUEST":
+      return 2;
+    case "LEASE_HELD_BY_OTHER":
+      return 1;
+    default:
+      return 3;
+  }
+}
+
+function reportFailure(
+  response: { code: string; message: string; hint?: string },
+  json: boolean,
+  exitCode: number,
+): void {
+  const body: Record<string, unknown> = { ok: false, code: response.code, message: response.message };
+  if (response.hint) body.hint = response.hint;
+  if (json) console.log(JSON.stringify(body, null, 2));
+  else console.error(`[ocg] ${response.code}: ${response.message}${response.hint ? `\n[ocg] ${response.hint}` : ""}`);
+  process.exitCode = exitCode;
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function cmdInboxWait(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  let timeoutSec = typeof args.timeout === "string" ? Number.parseInt(args.timeout, 10) : 60;
+  if (!Number.isFinite(timeoutSec)) timeoutSec = 60;
+  timeoutSec = Math.min(Math.max(timeoutSec, 0), 120);
+
+  const params = new URLSearchParams();
+  params.set("timeoutMs", String(timeoutSec * 1000));
+  if (typeof args.channel === "string") params.set("channel", args.channel);
+  if (typeof args.consumer === "string") params.set("consumer", args.consumer);
+  if (typeof args.max === "string") params.set("max", args.max);
+  if (args.peek === true) params.set("peek", "1");
+
+  const response = await daemonCall(args, "GET", `/ocg/inbox/wait?${params.toString()}`, {
+    timeoutMs: timeoutSec * 1000 + 15_000,
+  });
+  if (!response.ok) return reportFailure(response, json, queryExitCode(response.code));
+
+  const messages = Array.isArray(response.body.messages)
+    ? (response.body.messages as Array<Record<string, unknown>>)
+    : [];
+  if (json) {
+    console.log(JSON.stringify(response.body, null, 2));
+    return;
+  }
+  if (messages.length === 0) {
+    console.log(`[ocg] No messages (waited ${timeoutSec}s).`);
+    return;
+  }
+  for (const message of messages) {
+    const text = typeof message.text === "string" ? message.text.replace(/\n/g, "\\n") : "";
+    const preview = text.length > 120 ? `${text.slice(0, 120)}...` : text;
+    console.log(
+      `[ocg] ${String(message.id)}  ${String(message.channel)}  ${String(message.chatType)}` +
+      `  ${message.replyable === true ? "replyable" : "send-only"}`,
+    );
+    if (preview) console.log(`      ${preview}`);
+  }
+}
+
+async function cmdInboxList(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const params = new URLSearchParams();
+  if (typeof args.state === "string") params.set("state", args.state);
+  if (typeof args.limit === "string") params.set("limit", args.limit);
+  if (typeof args.channel === "string") params.set("channel", args.channel);
+  if (typeof args.since === "string") params.set("since", args.since);
+  const queryString = params.toString();
+  const response = await daemonCall(args, "GET", `/ocg/inbox${queryString ? `?${queryString}` : ""}`);
+  if (!response.ok) return reportFailure(response, json, queryExitCode(response.code));
+
+  const entries = Array.isArray(response.body.entries)
+    ? (response.body.entries as Array<Record<string, unknown>>)
+    : [];
+  if (json) {
+    console.log(JSON.stringify(response.body, null, 2));
+    return;
+  }
+  if (entries.length === 0) {
+    console.log("[ocg] No messages.");
+    return;
+  }
+  for (const entry of entries) {
+    const received = typeof entry.receivedAt === "number" ? new Date(entry.receivedAt).toISOString() : "";
+    console.log(
+      `[ocg] ${String(entry.id)}  ${String(entry.state)}  ${String(entry.channel)}  ` +
+      `${String(entry.chatType)}  ${received}` +
+      `${entry.consumer ? `  consumer=${String(entry.consumer)}` : ""}`,
+    );
+  }
+}
+
+async function cmdInboxShow(id: string | undefined, args: Args): Promise<void> {
+  const json = args["json"] === true;
+  if (!id) {
+    console.error("Usage: ocg inbox show <id> [--json]");
+    process.exitCode = 2;
+    return;
+  }
+  const response = await daemonCall(args, "GET", `/ocg/inbox/${encodeURIComponent(id)}`);
+  if (!response.ok) return reportFailure(response, json, queryExitCode(response.code));
+  if (json) {
+    console.log(JSON.stringify(response.body, null, 2));
+    return;
+  }
+
+  const entry = (response.body.entry ?? {}) as Record<string, unknown>;
+  const sender = (entry.sender ?? {}) as Record<string, unknown>;
+  const replyExpires = typeof entry.replyExpiresAt === "number" ? new Date(entry.replyExpiresAt).toISOString() : "?";
+  console.log(`id:         ${String(entry.id)}`);
+  console.log(`channel:    ${String(entry.channel)} (account ${String(entry.accountId)})`);
+  console.log(`state:      ${String(entry.state)}${entry.consumer ? `  consumer=${String(entry.consumer)}` : ""}`);
+  console.log(`target:     ${String(entry.target ?? "(unknown)")}`);
+  console.log(`sessionKey: ${String(entry.sessionKey)}`);
+  console.log(`replyable:  ${entry.replyable === true ? `yes (until ${replyExpires})` : "no (reply degrades to send)"}`);
+  console.log(`sender:     ${String(sender.id ?? "?")} ${sender.name ? `(${String(sender.name)})` : ""}`);
+  const media = Array.isArray(entry.media) ? (entry.media as Array<Record<string, unknown>>) : [];
+  for (const [index, item] of media.entries()) {
+    console.log(`media[${index}]:  path=${String(item.path ?? "(null — use show again later)")}  url=${String(item.url ?? "?")}  mime=${String(item.mime ?? "?")}`);
+  }
+  console.log(`text:\n${String(entry.text ?? "")}`);
+}
+
+async function cmdInboxAck(id: string | undefined, args: Args): Promise<void> {
+  const json = args["json"] === true;
+  if (!id) {
+    console.error("Usage: ocg inbox ack <id> [--force] [--consumer <name>] [--json]");
+    process.exitCode = 2;
+    return;
+  }
+  const body: Record<string, unknown> = {};
+  if (typeof args.consumer === "string") body.consumer = args.consumer;
+  if (args.force === true) body.force = true;
+  const response = await daemonCall(args, "POST", `/ocg/inbox/${encodeURIComponent(id)}/ack`, { body });
+  if (!response.ok) return reportFailure(response, json, ackExitCode(response.code));
+  if (json) console.log(JSON.stringify(response.body, null, 2));
+  else console.log(`[ocg] ${id} acked.`);
+}
+
+async function cmdInbox(command: string, args: Args): Promise<void> {
+  const tokens = command.split(/\s+/).filter(Boolean);
+  const sub = tokens[1];
+  switch (sub) {
+    case "wait": return cmdInboxWait(args);
+    case "list": return cmdInboxList(args);
+    case "show": return cmdInboxShow(tokens[2], args);
+    case "ack": return cmdInboxAck(tokens[2], args);
+    default:
+      console.error("Usage: ocg inbox <wait|list|show|ack> [options]");
+      process.exitCode = 2;
+  }
+}
+
+async function cmdReply(command: string, args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const tokens = command.split(/\s+/).filter(Boolean);
+  const id = tokens[1];
+  if (!id) {
+    console.error("Usage: ocg reply <id> (--text <text> | --text-file <path> | -) [--media <url-or-path>] [--error] [--json]");
+    process.exitCode = 2;
+    return;
+  }
+
+  let text: string | undefined;
+  const textFile = typeof args["text-file"] === "string" ? args["text-file"] : undefined;
+  const wantsStdin = tokens.includes("-") || args.text === "-";
+  if (typeof args.text === "string" && args.text !== "-") {
+    text = args.text;
+  } else if (textFile) {
+    try {
+      text = readFileSync(resolve(textFile), "utf8");
+    } catch (err) {
+      console.error(`[ocg] cannot read --text-file: ${(err as Error).message}`);
+      process.exitCode = 2;
+      return;
+    }
+  } else if (wantsStdin) {
+    text = await readStdin();
+  }
+
+  const mediaUrl = typeof args.media === "string" ? args.media : undefined;
+  const isError = args.error === true;
+  if ((text ?? "").trim() === "" && !mediaUrl) {
+    console.error("Usage: ocg reply <id> (--text <text> | --text-file <path> | -) [--media <url-or-path>] [--error] [--json]");
+    process.exitCode = 2;
+    return;
+  }
+
+  const body: Record<string, unknown> = {};
+  if (text !== undefined) body.text = text;
+  if (mediaUrl) body.mediaUrl = mediaUrl;
+  if (isError) body.isError = true;
+  if (typeof args.consumer === "string") body.consumer = args.consumer;
+  if (args.force === true) body.force = true;
+
+  const response = await daemonCall(args, "POST", `/ocg/inbox/${encodeURIComponent(id)}/reply`, {
+    body,
+    timeoutMs: 60_000,
+  });
+  if (!response.ok) return reportFailure(response, json, replyExitCode(response.code));
+
+  if (json) {
+    console.log(JSON.stringify(response.body, null, 2));
+    if (response.body.ok !== true) {
+      process.exitCode = replyExitCode(String(response.body.code ?? ""));
+    }
+    return;
+  }
+  console.log(
+    `[ocg] replied ${id} via ${String(response.body.via)} ` +
+    `(chunks=${String(response.body.chunks ?? "?")}, ${String(response.body.elapsedMs ?? "?")}ms)`,
+  );
+  const notes = Array.isArray(response.body.notes) ? (response.body.notes as unknown[]) : [];
+  for (const note of notes) console.log(`[ocg] note: ${String(note)}`);
+}
+
+async function cmdTargets(command: string, args: Args): Promise<void> {
+  const json = args["json"] === true;
+  if (command.split(/\s+/)[1] !== "list") {
+    console.error("Usage: ocg targets list [--channel <id>] [--limit <n>] [--json]");
+    process.exitCode = 2;
+    return;
+  }
+  const params = new URLSearchParams();
+  if (typeof args.channel === "string") params.set("channel", args.channel);
+  if (typeof args.limit === "string") params.set("limit", args.limit);
+  const queryString = params.toString();
+  const response = await daemonCall(args, "GET", `/ocg/targets${queryString ? `?${queryString}` : ""}`);
+  if (!response.ok) return reportFailure(response, json, queryExitCode(response.code));
+
+  const targets = Array.isArray(response.body.targets)
+    ? (response.body.targets as Array<Record<string, unknown>>)
+    : [];
+  if (json) {
+    console.log(JSON.stringify(response.body, null, 2));
+    return;
+  }
+  if (targets.length === 0) {
+    console.log("[ocg] No targets seen yet.");
+    return;
+  }
+  for (const target of targets) {
+    const lastSeen = typeof target.lastSeenAt === "number" ? new Date(target.lastSeenAt).toISOString() : "?";
+    console.log(
+      `${String(target.channel)}  ${String(target.target)}  ${String(target.chatType)}  ` +
+      `last ${lastSeen}  count ${String(target.count)}`,
+    );
+  }
+}
+
+// ── doctor (§5.11) ────────────────────────────────────────────────────────
+
+type DoctorCheck = { name: string; ok: boolean; warn?: boolean; detail?: string; hint?: string };
+
+async function cmdDoctor(args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const checks: DoctorCheck[] = [];
+  const add = (name: string, ok: boolean, extra: Partial<DoctorCheck> = {}): void => {
+    checks.push({ name, ok, ...extra });
+  };
+
+  // Node >= 22.12
+  const [major = 0, minor = 0] = process.versions.node.split(".").map((part) => Number.parseInt(part, 10));
+  const nodeOk = major > 22 || (major === 22 && minor >= 12);
+  add("Node.js >= 22.12", nodeOk, nodeOk
+    ? { detail: `v${process.versions.node}` }
+    : { detail: `v${process.versions.node}`, hint: "upgrade Node.js" });
+
+  // Config file
+  const configPath = resolveConfigPath();
+  if (!existsSync(configPath)) {
+    add("config file", false, { detail: `not found: ${configPath}`, hint: "create ocg.json (see ocg.example.json)" });
+  } else {
+    try {
+      JSON.parse(readFileSync(configPath, "utf8"));
+      add("config file", true, { detail: configPath });
+    } catch (err) {
+      add("config file", false, { detail: `invalid JSON: ${(err as Error).message}`, hint: `fix ${configPath}` });
+    }
+  }
+
+  // Channels
+  const configured = listConfiguredChannels();
+  add("at least one channel enabled", configured.length > 0, configured.length > 0
+    ? { detail: configured.join(", ") }
+    : { detail: "none", hint: "ocg channels add --channel <id> ..." });
+
+  // Mailbox mode
+  const raw = loadConfig() ?? {};
+  const mailboxOn = isMailboxConfigured(raw);
+  add('mailbox mode (agentType: "mailbox")', mailboxOn, mailboxOn
+    ? { detail: "enabled" }
+    : { detail: "disabled — inbox/reply need it", hint: 'set "agentType": "mailbox" globally or on a channel in ocg.json' });
+
+  // Daemon process state
+  const state = readGatewayProcessState();
+  const stateAlive = Boolean(state && isProcessRunning(state.pid));
+  add("daemon state file pid alive", stateAlive, stateAlive
+    ? { detail: `pid ${state!.pid}` }
+    : { detail: state ? `pid ${state.pid} is dead` : "no state file (never started as a daemon)", hint: "run: ocg daemon start" });
+
+  // Health + local token (health requires auth → 200 proves both)
+  const endpoint = resolveDaemonEndpoint();
+  const healthResponse = await daemonRequest(endpoint, "GET", "/ocg/health", { timeoutMs: 2500 });
+  if (healthResponse.ok) {
+    add("/ocg/health reachable", true, { detail: `${endpoint.baseUrl} (v${String(healthResponse.body.version ?? "?")})` });
+    add("local token accepted", true, { detail: resolveLocalTokenPath() });
+  } else {
+    add("/ocg/health reachable", false, {
+      detail: healthResponse.code === "DAEMON_NOT_RUNNING" ? `not reachable at ${endpoint.baseUrl}` : `${healthResponse.code}: ${healthResponse.message}`,
+      hint: healthResponse.code === "UNAUTHORIZED"
+        ? "restart the daemon to regenerate <configDir>/ocg-local-token"
+        : "check port/firewall or OCG_DAEMON_URL; then: ocg daemon start",
+    });
+    add("local token accepted", false, {
+      detail: healthResponse.code === "UNAUTHORIZED" ? "daemon rejected the token" : "unknown (daemon not reachable)",
+      hint: "restart the daemon",
+    });
+  }
+
+  // Channels running + mailbox backlog (only meaningful with health)
+  if (healthResponse.ok) {
+    const channels = Array.isArray(healthResponse.body.channels)
+      ? (healthResponse.body.channels as Array<Record<string, unknown>>)
+      : [];
+    const running = channels.filter((channel) => channel.status === "running");
+    add("channel(s) running", running.length > 0, running.length > 0
+      ? { detail: running.map((channel) => `${String(channel.id)}/${String(channel.accountId ?? "-")}`).join(", ") }
+      : { detail: "none running", hint: "ocg channels login --channel <id> / ocg daemon logs" });
+
+    const mailbox = (healthResponse.body.mailbox ?? {}) as Record<string, unknown>;
+    const pending = Number(mailbox.pending ?? 0);
+    const oldest = typeof mailbox.oldestPendingAt === "number" ? mailbox.oldestPendingAt : null;
+    const stale = oldest !== null && Date.now() - oldest > 10 * 60_000;
+    const backlogProblem = pending > 100 || stale;
+    checks.push({
+      name: "mailbox backlog",
+      ok: !backlogProblem,
+      warn: true,
+      detail: backlogProblem
+        ? `${pending} pending, oldest ${oldest ? new Date(oldest).toISOString() : "?"}`
+        : `${pending} pending`,
+    });
+  }
+
+  const failed = checks.filter((check) => !check.ok && check.warn !== true);
+  const body = {
+    ok: failed.length === 0,
+    checks: checks.map((check) => ({
+      name: check.name,
+      ok: check.ok,
+      ...(check.warn === true ? { warn: true } : {}),
+      ...(check.detail ? { detail: check.detail } : {}),
+      ...(check.hint ? { hint: check.hint } : {}),
+    })),
+  };
+
+  if (json) {
+    console.log(JSON.stringify(body, null, 2));
+  } else {
+    for (const check of checks) {
+      const mark = check.ok ? "✓" : check.warn === true ? "!" : "✗";
+      console.log(`${mark} ${check.name}${check.detail ? ` — ${check.detail}` : ""}`);
+      if (!check.ok && check.hint) console.log(`   hint: ${check.hint}`);
+    }
+    console.log("");
+    console.log(failed.length === 0 ? "[ocg] doctor: OK" : `[ocg] doctor: ${failed.length} problem(s)`);
+  }
+  process.exitCode = failed.length === 0 ? 0 : 1;
+}
+
+// ── skill (§5.10) ─────────────────────────────────────────────────────────
+
+async function cmdSkill(command: string, args: Args): Promise<void> {
+  const json = args["json"] === true;
+  const sub = command.split(/\s+/)[1];
+
+  if (sub === "show") {
+    process.stdout.write(buildSkillMarkdown(VERSION));
+    return;
+  }
+  if (sub !== "install") {
+    console.error("Usage: ocg skill <install|show> [--dir <path>] [--force] [--json]");
+    process.exitCode = 2;
+    return;
+  }
+
+  const content = buildSkillMarkdown(VERSION);
+  const targets: string[] = [join(homedir(), ".claude", "skills", "ocg")];
+  if (existsSync(join(process.cwd(), ".agents"))) {
+    targets.push(join(process.cwd(), ".agents", "skills", "ocg"));
+  }
+  if (typeof args.dir === "string" && args.dir.trim() !== "") {
+    targets.push(resolve(args.dir));
+  }
+
+  const force = args.force === true;
+  const results: Array<{ path: string; status: string }> = [];
+  for (const dir of targets) {
+    const file = join(dir, "SKILL.md");
+    mkdirSync(dir, { recursive: true });
+    if (existsSync(file)) {
+      const existing = readFileSync(file, "utf8");
+      if (existing === content) {
+        results.push({ path: file, status: "up-to-date" });
+        continue;
+      }
+      if (!force) {
+        results.push({ path: file, status: "exists-different" });
+        continue;
+      }
+    }
+    writeFileSync(file, content, "utf8");
+    results.push({ path: file, status: "installed" });
+  }
+
+  if (json) {
+    console.log(JSON.stringify({ ok: true, results }, null, 2));
+    return;
+  }
+  for (const result of results) {
+    if (result.status === "installed") console.log(`[ocg] installed: ${result.path}`);
+    else if (result.status === "up-to-date") console.log(`[ocg] already up to date: ${result.path}`);
+    else console.log(`[ocg] exists with different content (use --force to overwrite): ${result.path}`);
+  }
+}
+
 // ── Main dispatch ─────────────────────────────────────────────────────────
 
 async function run(): Promise<void> {
@@ -1176,9 +2049,17 @@ async function run(): Promise<void> {
   if (command === "version") { console.log(`ocg v${VERSION}`); return; }
   if (command === "send") return cmdSend(args);
 
+  // Daemon / mailbox / agent commands
+  if (command === "doctor") return cmdDoctor(args);
+  if (command === "reply" || command.startsWith("reply ")) return cmdReply(command, args);
+  if (command === "inbox" || command.startsWith("inbox ")) return cmdInbox(command, args);
+  if (command === "daemon" || command.startsWith("daemon ")) return cmdDaemon(command, args);
+  if (command === "targets" || command.startsWith("targets ")) return cmdTargets(command, args);
+  if (command === "skill" || command.startsWith("skill ")) return cmdSkill(command, args);
+
   switch (command) {
     case "stop": return cmdStop();
-    case "restart": return cmdRestart();
+    case "restart": return cmdRestart(args);
     case "status": return cmdStatus(args);
     case "chat": return cmdChat(command, args);
     case "test": return cmdTest();

@@ -8,9 +8,10 @@
  * Any bundled or external OpenClaw IM plugin works out of the box.
  */
 
-import { loadConfig, resolveConfigPath, resolveConfigDir, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
+import { loadConfig, resolveConfigPath, resolveConfigDir, buildOpenClawConfig, applyConfigEnvOverrides, asAgentType, type LiteGatewayConfig } from "./config.js";
 import { startAll, stopAll, listRunningChannels } from "./gateway.js";
-import { stopCallbackServer } from "./callback-server.js";
+import { stopCallbackServer, getCallbackPort } from "./callback-server.js";
+import { resetMailbox } from "./mailbox.js";
 import {
   clearGatewayProcessState,
   readActiveGatewayProcessState,
@@ -55,20 +56,33 @@ export async function startGateway(): Promise<void> {
   if (channelIds.length === 0) throw new Error("No channels configured");
 
   const results = await startAll(cfg);
-  writeGatewayProcessState(cfg, results.map((r) => ({
-    channelId: r.channelId,
-    accountId: r.accountId,
-    status: "running",
-    startedAt: r.startedAt,
-  })));
+  writeGatewayProcessState(
+    cfg,
+    results.map((r) => ({
+      channelId: r.channelId,
+      accountId: r.accountId,
+      status: "running",
+      startedAt: r.startedAt,
+    })),
+    {
+      port: getCallbackPort() || rawCallbackPort(cfg),
+      host: cfg.callbackHost ?? "0.0.0.0",
+    },
+  );
   // startAll reports each account individually; dedupe by channel
   const uniqueChannelIds = new Set(results.map((r) => r.channelId));
   console.log(`[ocg] ${uniqueChannelIds.size} channel(s) running (${results.length} account(s))`);
 }
 
+/** The configured callback port (the bound port is preferred when listening). */
+function rawCallbackPort(cfg: LiteGatewayConfig): number | undefined {
+  return cfg.callbackPort;
+}
+
 export async function stopGateway(): Promise<void> {
   await stopAll();
   await stopCallbackServer();
+  resetMailbox();
   clearGatewayProcessState();
 }
 
@@ -98,16 +112,22 @@ export function gatewayStatus(): Record<string, unknown> {
     }
   }
 
-  const agentType = cfg?.agentType ?? (cfg?.acp ? "acp" : process.env.OCG_AGENT_TYPE) ?? "http";
+  const agentType = asAgentType(cfg?.agentType) ?? (cfg?.acp ? "acp" : asAgentType(process.env.OCG_AGENT_TYPE)) ?? "http";
+
+  const typeUrl = (type: string, url: string | undefined): string =>
+    type === "acp" ? "acp://stdio" : type === "mailbox" ? "mailbox://local" : (url ?? "(not set)");
 
   return {
     configured: configured.length,
     running: new Set(running.map((b) => b.channelId)).size,
     channels: running.map((b) => {
       const channelCfg = cfg?.channels?.[b.channelId] as Record<string, unknown> | undefined;
-      const channelAgentType = channelCfg?.agentType === "acp" || channelCfg?.acp ? "acp" : (channelCfg?.agentType ?? agentType);
+      const channelAgentType = asAgentType(channelCfg?.agentType) ?? (channelCfg?.acp ? "acp" : agentType);
       // Show per-channel agentUrl if set, otherwise fall back to global
-      const chAgentUrl = channelAgentType === "acp" ? "acp://stdio" : (channelAgentUrls[b.channelId] || cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)");
+      const chAgentUrl = typeUrl(
+        channelAgentType,
+        channelAgentUrls[b.channelId] || cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL,
+      );
       return {
         id: b.channelId,
         accountId: "accountId" in b ? b.accountId : undefined,
@@ -120,7 +140,7 @@ export function gatewayStatus(): Record<string, unknown> {
     }),
     pid: processState?.pid,
     agentType,
-    agentUrl: agentType === "acp" ? "acp://stdio" : (cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL || "(not set)"),
+    agentUrl: typeUrl(agentType, cfg?.agentUrl || processState?.agentUrl || process.env.OCG_AGENT_URL),
     acp: cfg?.acp,
     model: cfg?.model || processState?.model || process.env.OCG_MODEL || "(not set)",
   };

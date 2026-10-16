@@ -24,9 +24,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
-import { deliverPayloadInChunks, resolveReplyChunkSize, rewriteLocalMediaPathsForDelivery } from "../reply-chunking.js";
-import { resolveChannelAcpConfig, resolveChannelAgentType, resolveChannelAgentUrl, resolveChannelIdFromContext } from "../config.js";
-import { buildAcpConfigFromEnv, getAcpAgent } from "../acp-agent.js";
+import { dispatchInbound } from "../inbound.js";
 import type { DeliverFn } from "../reply-chunking.js";
 
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
@@ -289,7 +287,7 @@ async function settleReplyDispatcher(params: {
   }
 }
 
-// ── HTTP-forward dispatchReplyFromConfig ─────────────────────────────────
+// ── dispatchReplyFromConfig → shared inbound dispatch ─────────────────────
 
 /**
  * Our replacement for the OpenClaw agent pipeline.
@@ -299,9 +297,13 @@ async function settleReplyDispatcher(params: {
  *
  *   channelRuntime.reply.dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyOptions })
  *
- * We intercept that call here: extract the user message, send to the
- * configured HTTP agent endpoint, receive the response, and deliver it
- * back through the dispatcher (which sends it via WeChat).
+ * We intercept that call here and hand it to the shared inbound dispatch
+ * (`src/inbound.ts`), which selects the transport (mailbox / ACP / HTTP) and
+ * delivers replies back through the dispatcher (which sends them via WeChat).
+ *
+ * Delivery semantics of this entry (preserved from the pre-1.3.0
+ * implementation): block streaming honours `disableBlockStreaming`, and the
+ * final payload is skipped when blocks were already delivered.
  */
 async function dispatchReplyFromConfig(params: {
   ctx: Record<string, unknown>;
@@ -327,333 +329,29 @@ async function dispatchReplyFromConfig(params: {
     return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
   }
 
-  const from = String(ctx.From ?? "unknown");
-  const sessionKey = String(ctx.SessionKey ?? "default");
-
-  // Resolve channel id from explicit context fields first, then SessionKey/From.
-  const channelId = resolveChannelIdFromContext(ctx) || sessionKey.split(":")[0] || undefined;
-  const agentUser = channelId && !sessionKey.startsWith(`${channelId}:`)
-    ? `${channelId}:${sessionKey}`
-    : sessionKey;
-
-  /** Rewrite local file paths in reply text so QQ Bot plugin can access them. */
-  const maybeRewriteMedia = (text: string) =>
-    channelId === "qqbot" ? rewriteLocalMediaPathsForDelivery(text) : text;
-
-  const agentType = resolveChannelAgentType(channelId, cfg);
-
-  // Resolve agent API URL — per-channel override first, then global fallback
-  const agentUrl = agentType === "http" ? resolveChannelAgentUrl(channelId, cfg) : "acp://stdio";
-
-  const liteGw = (cfg.liteGateway ?? {}) as Record<string, unknown>;
-
-  const modelRaw =
-    (liteGw.model as string | Record<string, unknown>) ||
-    (cfg.agents &&
-    typeof cfg.agents === "object" &&
-    (cfg.agents as Record<string, unknown>).defaults &&
-    typeof (cfg.agents as Record<string, unknown>).defaults === "object"
-      ? ((cfg.agents as Record<string, unknown>).defaults as Record<string, unknown>).model
-      : undefined) ||
-    process.env.OCG_MODEL ||
-    "gpt-4o";
-
-  const modelStr =
-    typeof modelRaw === "string"
-      ? modelRaw
-      : typeof modelRaw === "object" && modelRaw && typeof (modelRaw as Record<string, unknown>).primary === "string"
-        ? (modelRaw as Record<string, string>).primary
-        : process.env.OCG_MODEL || "gpt-4o";
-
-  const apiKey = (process.env.OCG_API_KEY as string) || "";
-
-  const verbose =
-    (liteGw.verbose as boolean) ||
-    process.env.OCG_VERBOSE === "1";
-  const replyChunkSize = resolveReplyChunkSize(liteGw.replyChunkSize);
-
-  // ── Log incoming message ──────────────────────────────────────────────
-  console.log(`\n${"=".repeat(60)}`);
-  console.log(`📥 [IN]  From: ${from}  |  Session: ${sessionKey}`);
-  if (verbose) {
-    console.log(`       Body (${body.length} chars):`);
-    const preview = body.length > 2000 ? body.slice(0, 2000) + "\n... (truncated)" : body;
-    console.log(preview.split("\n").map((l: string) => `       │ ${l}`).join("\n"));
-  } else {
-    const oneLiner = body.replace(/\n/g, "\\n");
-    const preview =
-      oneLiner.length > 200 ? oneLiner.slice(0, 200) + "..." : oneLiner;
-    console.log(`       Body: ${preview}`);
-  }
-  console.log(`       → ${modelStr} @ ${agentUrl}`);
-
-  // ── ACP stdio mode ─────────────────────────────────────────────────
-  if (agentType === "acp") {
-    const acpCfg = {
-      ...buildAcpConfigFromEnv(),
-      ...resolveChannelAcpConfig(channelId, cfg),
-      model: modelStr,
-    };
-    const agent = getAcpAgent(acpCfg);
-    let fullText = "";
-    const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
-
-    try {
-      const streamBlocks = liteGw.acpStreamBlocks === true || ctx.AcpStreamBlocks === true;
-      fullText = await agent.chat(sessionKey, body, {
-        onDelta: async (text) => {
-          if (!streamBlocks || !text || params.replyOptions?.disableBlockStreaming === true) return;
-          dispatcher.sendBlockReply({ text: maybeRewriteMedia(text), isError: false });
-          deliveredCounts.block++;
-        },
-      });
-
-      if (fullText && deliveredCounts.block === 0) {
-        deliveredCounts.final += await deliverPayloadInChunks(
-          async (payload) => {
-            dispatcher.sendFinalReply(payload);
-          },
-          { text: maybeRewriteMedia(fullText), isError: false },
-          { kind: "final", assistantMessageIndex: 0 },
-          replyChunkSize,
-        );
-      }
-
-      console.log(`📤 [OUT:ACP] ${fullText.length} chars, ${deliveredCounts.block} blocks`);
-      console.log(`${"=".repeat(60)}\n`);
-      return { queuedFinal: true, counts: deliveredCounts };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[ocg] ACP dispatch error: ${message}`);
-      try {
-        dispatcher.sendFinalReply({ text: `ACP agent error: ${message}`, isError: true });
-      } catch {
-        // Best effort.
-      }
-      return { queuedFinal: true, counts: { block: 0, final: 1, tool: 0 } };
-    }
-  }
-
-  // ── Async (fire & forget) mode ──────────────────────────────────────
-  const isAsync = Boolean(liteGw.async);
-  if (isAsync) {
-    const { registerDeliver, buildCallbackUrl, getCallbackPort } =
-      await import("../callback-server.js");
-
-    // Wrap dispatcher methods into a single deliver function
-    const deliver: DeliverFn = async (payload, meta) => {
-      const rewritten = typeof payload.text === "string"
-        ? { ...payload, text: maybeRewriteMedia(payload.text) }
-        : payload;
-      if (meta.kind === "block") {
-        dispatcher.sendBlockReply(rewritten);
-      } else {
-        dispatcher.sendFinalReply(rewritten);
-      }
-    };
-
-    const ttlMs = ((liteGw.callbackTokenTTL as number) ?? 1800) * 1000;
-    const callbackToken = registerDeliver(deliver, ttlMs);
-    const callbackHost = (liteGw.callbackPublicHost as string) ?? (liteGw.callbackHost as string) ?? "0.0.0.0";
-    const callbackPort = (liteGw.callbackPublicPort as number) ?? (getCallbackPort() || (liteGw.callbackPort as number) || 3457);
-    const callbackUrl = buildCallbackUrl(callbackHost, callbackPort, callbackToken);
-
-    console.log(`[ocg] Async dispatch → agent, callback=${callbackUrl}`);
-
-    const asyncHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
-      "X-OCG-Callback": callbackUrl,
-    };
-    if (from && from !== "unknown") {
-      // The peer this message came from, in the gateway's own target vocabulary
-      // (e.g. qqbot:c2c:<openid>, qqbot:group:<id>). `user` carries the session key, which the
-      // agent side cannot send back to, so a proactive send needs the target as well.
-      asyncHeaders["X-OCG-Target"] = from;
-    }
-    if (apiKey) {
-      asyncHeaders["Authorization"] = `Bearer ${apiKey}`;
-    }
-
-    // Fire & forget — do NOT await
-    // Request body stays OpenAI-compatible; user carries the stable IM session key.
-    fetch(agentUrl, {
-      method: "POST",
-      headers: asyncHeaders,
-      body: JSON.stringify({
-        model: modelStr,
-        messages: [{ role: "user", content: body }],
-        stream: false,
-        user: agentUser,
-      }),
-      signal: AbortSignal.timeout(300_000),
-    }).catch((err: Error) => {
-      console.error(`[ocg] Async forward error: ${err.message}`);
-    });
-
-    return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
-  }
-
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (from && from !== "unknown") {
-    headers["X-OCG-Target"] = from;
-  }
-  if (apiKey) {
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-
-  try {
-    const response = await fetch(agentUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: modelStr,
-        messages: [{ role: "user", content: body }],
-        stream: true,
-        user: agentUser,
-      }),
-      signal: AbortSignal.timeout(300_000),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => "");
-      throw new Error(`Agent API returned ${response.status}: ${errText.slice(0, 200)}`);
-    }
-
-    const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
-    const disableBlockStreaming = params.replyOptions?.disableBlockStreaming === true;
-    let fullText = "";
-    let finalDelivered = false;
-    const deliveredCounts: Record<string, number> = { block: 0, final: 0, tool: 0 };
-
-    // Helper: queue content — when block streaming is disabled, skip blocks
-    const queueBlock = (text: string) => {
-      if (disableBlockStreaming) return;
-      dispatcher.sendBlockReply({ text: maybeRewriteMedia(text), isError: false });
-      deliveredCounts.block++;
-    };
-
-    // ── Case 1: SSE streaming (text/event-stream) ─────────────────────────
-    if (contentType.includes("text/event-stream")) {
-      console.log(`[ocg] SSE stream detected, reading chunks...`);
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        // Log raw chunk for debugging
-        if (verbose || fullText.length === 0) {
-          console.log(`[ocg] SSE raw chunk (${chunk.length} bytes):\n${chunk.slice(0, 500)}`);
-        }
-
-        const lines = chunk.split("\n");
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data:")) continue;
-
-          const data = trimmed.slice(5).trim();
-          if (data === "[DONE]") continue;
-
-          try {
-            const parsed = JSON.parse(data);
-            // OpenAI format: choices[0].delta.content
-            const content =
-              parsed.choices?.[0]?.delta?.content ??
-              parsed.choices?.[0]?.message?.content ??
-              parsed.content ??
-              parsed.text ??
-              "";
-            if (!content) continue;
-
-            if (verbose) console.log(`[ocg] SSE delta: "${content}"`);
-            fullText += content;
-            queueBlock(content);
-          } catch (parseErr) {
-            console.warn(`[ocg] SSE parse error: ${(parseErr as Error).message} — data: ${data.slice(0, 100)}`);
-          }
-        }
-      }
+  // Adapt the dispatcher into a single deliver function. The dispatcher applies
+  // its own beforeDeliver hooks and typing lifecycle; block vs final routing is
+  // the only thing this adapter decides.
+  const deliver: DeliverFn = async (payload, meta) => {
+    if (meta.kind === "block") {
+      dispatcher.sendBlockReply(payload);
     } else {
-      // ── Case 2: Non-streaming JSON (plain application/json) ─────────────
-      console.log(`[ocg] Non-streaming response (content-type: ${contentType || "none"}), reading body...`);
-      const rawText = await response.text();
-      console.log(`[ocg] Raw response (${rawText.length} bytes):\n${rawText.slice(0, 1500)}`);
-
-      try {
-        const parsed = JSON.parse(rawText);
-        // Try multiple possible response shapes
-        const content =
-          parsed.choices?.[0]?.message?.content ??
-          parsed.choices?.[0]?.delta?.content ??
-          parsed.choices?.[0]?.text ??
-          parsed.content ??
-          parsed.text ??
-          parsed.response ??
-          parsed.message ??
-          "";
-
-        if (typeof content === "string" && content.trim()) {
-          fullText = content;
-          // Non-streaming: only final reply, no block (avoids duplicate)
-        }
-      } catch (parseErr) {
-        // Treat raw text as response
-        console.warn(`[ocg] JSON parse failed: ${(parseErr as Error).message}, treating as raw text`);
-        if (rawText.trim()) {
-          fullText = rawText;
-        }
-      }
+      dispatcher.sendFinalReply(payload);
     }
+  };
 
-    // Send final payload (skip if blocks already delivered the content incrementally)
-    if (fullText && deliveredCounts.block === 0) {
-      deliveredCounts.final += await deliverPayloadInChunks(
-        async (payload) => {
-          dispatcher.sendFinalReply(payload);
-        },
-        { text: maybeRewriteMedia(fullText), isError: false },
-        { kind: "final", assistantMessageIndex: 0 },
-        replyChunkSize,
-      );
-      finalDelivered = true;
-    } else {
-      console.warn(`[ocg] No text extracted from response`);
-    }
+  const result = await dispatchInbound({
+    ctx,
+    cfg,
+    deliver,
+    replyOptions: params.replyOptions,
+    finalPolicy: "unless-blocks",
+  });
 
-    // ── Log outgoing response ───────────────────────────────────────────
-    console.log(`📤 [OUT] ${fullText.length} chars, ${deliveredCounts.block} blocks`);
-    if (verbose) {
-      const lines = fullText.split("\n");
-      for (const line of lines) {
-        console.log(`       │ ${line}`);
-      }
-    } else {
-      const oneLiner = fullText.replace(/\n/g, "\\n");
-      const preview =
-        oneLiner.length > 300 ? oneLiner.slice(0, 300) + "..." : oneLiner;
-      console.log(`       Text: ${preview}`);
-    }
-    console.log(`${"=".repeat(60)}\n`);
-
-    return { queuedFinal: finalDelivered, counts: deliveredCounts };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[ocg] Agent dispatch error: ${message}`);
-
-    // Deliver error to the user
-    try {
-      dispatcher.sendFinalReply({
-        text: `\u26a0\ufe0f Agent error: ${message}`,
-        isError: true,
-      });
-    } catch {
-      // Best effort
-    }
-
-    return { queuedFinal: true, counts: { block: 0, final: 1, tool: 0 } };
-  }
+  return {
+    queuedFinal: result.queuedFinal === true,
+    counts: (result.counts as Record<string, number> | undefined) ?? { tool: 0, block: 0, final: 0 },
+  };
 }
 
 // ── resolveStorePath (fallback) ──────────────────────────────────────────

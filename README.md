@@ -67,10 +67,11 @@ Create `ocg.json` (see `ocg.example.json` for reference):
 
 ### Per-Channel Agent Transport
 
-OCG supports two agent transports:
+OCG supports three agent transports:
 
 - `http` — OpenAI-compatible Chat Completions endpoint. HTTP mode can stream SSE blocks to IM channels.
 - `acp` — local ACP stdio agent subprocess. ACP mode keeps a long-running process and reuses sessions by IM conversation; by default it buffers streaming deltas and sends one final IM message.
+- `mailbox` — inbound messages are queued in the daemon and **pulled by a short-lived CLI** (`ocg inbox wait` / `ocg reply`), for coding agents that live in a terminal. See [Mailbox Mode](#mailbox-mode-agent-cli).
 
 Each channel can override the global `agentType`, `agentUrl`, and `acp` settings. If a channel does not specify an override, it falls back to the global settings.
 
@@ -165,10 +166,16 @@ That's it — OCG will start all enabled channels and begin forwarding messages 
 |---|---|
 | `ocg start` | Start all enabled channels in the foreground |
 | `ocg start --background` / `ocg start -d` | Start all enabled channels as a detached background process |
-| `ocg start --log-file [--log-dir <dir>]` | Write start logs to a file (default: `~/.openclaw-channel-gateway/ocg.logs/`) |
-| `ocg stop` | Stop all channels |
-| `ocg restart` | Restart all channels |
-| `ocg status` | Show gateway status, including background-started channels |
+| `ocg start --log-file [--log-dir <dir>]` | Write start logs to a file (default: `<configDir>/ocg.logs/`) |
+| `ocg stop` | Stop the gateway (the background daemon process, when one is running) |
+| `ocg restart` | Restart the gateway |
+| `ocg status` | Show gateway status, including daemon health when reachable |
+| `ocg daemon start\|stop\|status\|logs` | Daemon control: start (background + health poll), stop, health/mailbox status, log tail (`--tail`, `--follow`) |
+| `ocg inbox wait\|list\|show\|ack` | Mailbox: pull / inspect / finish queued messages (mailbox mode) |
+| `ocg reply <id> (--text <t> \| --text-file <f> \| -) [--media <url>] [--error]` | Reply to a pulled message (`-` reads stdin) |
+| `ocg targets list` | Recently seen send targets (mailbox mode) |
+| `ocg doctor [--json]` | Diagnose config, daemon, local token, channels, mailbox backlog |
+| `ocg skill install\|show` | Install / print the agent SKILL.md (`~/.claude/skills/ocg/`, `./.agents/skills/ocg/`) |
 | `ocg send --channel <id> --to <target> --text <text>` | Proactively send a message to a channel target (see [Proactive Send](#proactive-send)) |
 | `ocg test` | Run dispatch smoke test |
 | `ocg version` | Print version |
@@ -349,7 +356,7 @@ ocg send --channel qqbot --to qqbot:c2c:OPENID --media-url https://example.com/x
 
 Exit codes: `0` sent / `1` platform failure (including timeout) / `2` bad arguments / `3` disabled, not ready, or no outbound adapter.
 
-`ocg send` runs in its own process and loads the channel plugin on demand, so it works without a running gateway. It does **not** share in-memory state with the gateway process (account runtime state, plugin-side rate-limit counters), so prefer the HTTP endpoint for delivery that must be coordinated with a live gateway.
+`ocg send` prefers the running daemon (`POST /ocg/send`, authenticated with the local token — plugins are already loaded and account runtime state is shared). When no daemon is running it falls back to an in-process implementation that loads the channel plugin on demand and works standalone; the JSON output marks which path served the request (`inProcess: true/false`).
 
 ### Delivery semantics
 
@@ -372,6 +379,84 @@ Support request when you see one of these.
 
 ---
 
+## Mailbox Mode (agent CLI)
+
+`agentType: "mailbox"` flips the direction of the reply flow: instead of OCG
+pushing a message into an agent endpoint, inbound IM messages are **queued in
+the daemon** and pulled by a short-lived CLI. It is built for coding agents
+running in a terminal (Claude Code, Codex, OpenCode, …) that want a
+`wait → process → reply` loop with plain shell commands.
+
+```bash
+# Terminal A — the daemon (channels + queue + callback server)
+ocg daemon start
+
+# Terminal B (or the agent itself)
+ocg inbox wait --timeout 60 --json      # blocks; exit 0 with [] on timeout
+ocg reply m_abc123 --text "on it" --json
+echo "long answer" | ocg reply m_abc123 - --json
+```
+
+Agents can install the bundled skill file (`SKILL.md`) so their model knows the
+loop, message shape and pitfalls without human explanation:
+
+```bash
+ocg skill install          # ~/.claude/skills/ocg/ (+ ./.agents/skills/ocg/ when present)
+ocg skill show             # print the same content
+```
+
+### Commands
+
+| Command | Behavior |
+|---|---|
+| `ocg inbox wait [--timeout 60] [--channel <id>] [--consumer <name>] [--max N] [--peek]` | Long-poll for queued messages (≤120 s). Each message gets a **lease** (default 5 min); use `--consumer` when several agents run in parallel. No messages → empty list, exit 0. |
+| `ocg reply <id> --text <t>` / `--text-file <f>` / `-` | Reply. Prefers the plugin's passive-reply handle; after it expires (or across a daemon restart) OCG degrades to a proactive send to the same peer — the response says `via: "reply"` or `"send"`. One reply per message (`ALREADY_REPLIED` otherwise). |
+| `ocg inbox list [--state pending,leased,done,all] [--limit N]` | Inspect the queue (default: `pending,leased`, newest first). |
+| `ocg inbox show <id>` | Full detail incl. media paths (media downloads may still be in flight). |
+| `ocg inbox ack <id> [--force]` | Finish a message without replying. `--force` breaks another consumer's lease (human intervention). |
+| `ocg targets list` | Recently seen peers — the `target` values to use with `ocg send`. |
+
+### Config (all optional)
+
+```jsonc
+{
+  "agentType": "mailbox",              // globally, or per channel: channels.<id>.agentType
+  "mailboxLeaseMs": 300000,            // lease duration per pulled message
+  "mailboxReplyTTL": 1800,             // passive-reply window (seconds; defaults to callbackTokenTTL)
+  "mailboxMaxPending": 1000,           // queue cap (oldest pending message is dropped beyond it)
+  "mailboxMaxRedeliveries": 5,         // lease expiries before a message is marked expired
+  "mailboxDownloadMedia": true,        // download remote media URLs into <configDir>/mailbox/media/
+  "mailboxMediaRetentionDays": 7,
+  "mailboxHistoryRetentionDays": 30    // JSONL log retention
+}
+```
+
+The queue is mirrored to an append-only `mailbox.jsonl`; after a daemon
+restart, unfinished messages are re-queued (replayed messages are no longer
+`replyable`, so replies degrade to `send`).
+
+### HTTP surface
+
+Everything the CLI does is available over HTTP on the callback server
+(`POST /ocg/send` included): `GET /ocg/health`, `/ocg/inbox`, `/ocg/inbox/wait`,
+`/ocg/inbox/{id}`, `POST /ocg/inbox/{id}/ack|reply`, `GET /ocg/targets`.
+Authenticate with the local token (generated at `<configDir>/ocg-local-token`,
+accepted from loopback only when bound to `0.0.0.0`) or the usual
+`X-OCG-Signature` HMAC.
+
+### Exit codes (inbox/reply)
+
+`0` success (a `wait` timeout is also 0) · `1` delivery failure
+(`PLATFORM_SEND_FAILED`, `REPLY_EXPIRED`, `ALREADY_REPLIED`, lease conflict) ·
+`2` bad arguments / unknown id · `3` daemon not running, auth failed, or
+capability disabled (`DISABLED`, `MAILBOX_DISABLED`).
+
+> `QQ` note: replying within the passive window uses the plugin's reply
+> channel and is not subject to proactive-message windows — that is exactly
+> why `reply` prefers the handle and only degrades to `send` when it is gone.
+
+---
+
 ## Development
 
 ```bash
@@ -384,6 +469,12 @@ npm run build
 # Production run
 npm start
 
-# Proactive send smoke test (mock plugin + real HTTP route)
+# Unit / regression suites (send, dispatch, acp, loader, mailbox, agent routes)
+npm test
+
+# End-to-end: real CLI processes against a live daemon
+npm run test:e2e
+
+# Proactive send smoke test only (mock plugin + real HTTP route)
 npx tsx src/send-test.ts
 ```

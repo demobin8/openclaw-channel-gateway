@@ -9,12 +9,15 @@
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { deliverPayloadInChunks } from "./reply-chunking.js";
 import { buildOpenClawConfig, loadConfig, resolveSendSettings, type SendSettings } from "./config.js";
 import { executeSend, type SendRequest } from "./send-service.js";
 import type { ChannelPluginObject } from "./plugin-loader.js";
 import { ensureChannelPluginLoaded, getChannelPlugin } from "./plugin-loader.js";
+import { jsonBody, readBody, readBodyLimited } from "./http-util.js";
+import { isLoopbackAddress, isWildcardHost, localTokenMatches, readLocalToken, verifyHmacSignature } from "./local-auth.js";
+import { agentRouteAuthOptions, defaultAgentRouteContext, handleAgentRoutes, type AgentRouteContext } from "./agent-routes.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -75,73 +78,6 @@ export function consumeDeliver(token: string): DeliverFn | undefined {
 
 function randomToken(): string {
   return randomBytes(32).toString("hex");
-}
-
-function jsonBody<T = unknown>(res: ServerResponse, code: number, body: T): void {
-  res.writeHead(code, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(body));
-}
-
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
-/**
- * Read a request body with a hard size cap.
- *
- * Oversized bodies are drained (not destroyed) so the 413 response can still be
- * delivered on the same connection. Rejects with `code: "PAYLOAD_TOO_LARGE"`.
- */
-async function readBodyLimited(req: IncomingMessage, limit: number): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let oversized = false;
-    req.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > limit) {
-        oversized = true;
-        chunks.length = 0;
-        return;
-      }
-      if (!oversized) chunks.push(chunk);
-    });
-    req.on("end", () => {
-      if (oversized) {
-        const err = new Error(`request body exceeds ${limit} bytes`) as NodeJS.ErrnoException;
-        err.code = "PAYLOAD_TOO_LARGE";
-        reject(err);
-        return;
-      }
-      resolve(Buffer.concat(chunks));
-    });
-    req.on("error", (err) => reject(err));
-  });
-}
-
-// ── HMAC verification ──────────────────────────────────────────────────
-
-function verifyHmac(
-  rawBody: Buffer,
-  signatureHeader: string | undefined,
-  secret: string,
-): boolean {
-  if (!signatureHeader) return false;
-  // Expected format: sha256=<hex-digest>
-  const match = signatureHeader.match(/^sha256=([0-9a-fA-F]{64})$/);
-  if (!match) return false;
-
-  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
-  const received = Buffer.from(match[1], "hex");
-  const expectedBuf = Buffer.from(expected, "hex");
-
-  if (received.length !== expectedBuf.length) return false;
-  return timingSafeEqual(received, expectedBuf);
 }
 
 // ── Server ─────────────────────────────────────────────────────────────
@@ -207,13 +143,18 @@ function defaultSendRouteContext(): SendRouteContext {
  *
  * Auth is deliberately first-class: with no configured secret the endpoint
  * answers `403 DISABLED` (a sandbox-local port must never relay messages for
- * unauthenticated callers), and with a secret the raw body must carry a valid
- * `X-OCG-Signature` HMAC.
+ * unauthenticated callers). With a secret the raw body must carry a valid
+ * `X-OCG-Signature` HMAC — or, for same-machine CLI callers, the local token
+ * (`X-OCG-Local-Token`, loopback only when the server binds a wildcard host;
+ * see §5.9). The local token satisfies authentication but does NOT lift the
+ * secret requirement: an operator without sendSecret still gets `403 DISABLED`,
+ * exactly like the in-process `ocg send`.
  */
 async function handleSendRequest(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: SendRouteContext,
+  auth: { localToken: string | null; localTokenLoopbackOnly: boolean },
 ): Promise<void> {
   let settings: SendSettings;
   try {
@@ -249,14 +190,23 @@ async function handleSendRequest(
     return;
   }
 
-  if (settings.secret && !verifyHmac(rawBody, req.headers["x-ocg-signature"] as string | undefined, settings.secret)) {
-    console.warn("[ocg] send HMAC verification failed");
-    jsonBody(res, 401, {
-      ok: false,
-      code: "BAD_SIGNATURE",
-      message: "signature verification failed",
-    });
-    return;
+  // Authentication: a valid local token (loopback only when bound to a
+  // wildcard host) OR a valid HMAC signature over the raw body.
+  const tokenHeader = req.headers["x-ocg-local-token"];
+  const localOk =
+    localTokenMatches(auth.localToken, typeof tokenHeader === "string" ? tokenHeader : undefined) &&
+    (!auth.localTokenLoopbackOnly || isLoopbackAddress(req.socket?.remoteAddress));
+  if (!localOk) {
+    const sigHeader = req.headers["x-ocg-signature"] as string | undefined;
+    if (!settings.secret || !verifyHmacSignature(rawBody, sigHeader, settings.secret)) {
+      console.warn("[ocg] send auth failed (no valid local token or signature)");
+      jsonBody(res, 401, {
+        ok: false,
+        code: "BAD_SIGNATURE",
+        message: "signature verification failed",
+      });
+      return;
+    }
   }
 
   let request: SendRequest;
@@ -292,17 +242,28 @@ async function handleSendRequest(
 /**
  * Start the callback HTTP server.
  *
+ * Routes (see techdesign §5.6):
+ *   POST /ocg/callback/{token}    reply delivery for async dispatch
+ *   POST /ocg/send                proactive send (HMAC or local token)
+ *   GET  /ocg/health              daemon liveness / capabilities
+ *   GET  /ocg/inbox[/wait|/{id}]  mailbox pull routes (local token or HMAC)
+ *   POST /ocg/inbox/{id}/ack|reply
+ *   GET  /ocg/targets
+ *
  * @param host - bind address (default "127.0.0.1")
  * @param port - bind port (default 3457)
  * @param secret - optional HMAC shared secret for signature verification
- * @param options.send - injection seam for the `/ocg/send` route (tests)
+ * @param options.send  - injection seam for the `/ocg/send` route (tests)
+ * @param options.agent - injection seam for the agent routes (tests)
+ * @param options.localToken - override the local token (null disables local
+ *        token auth; undefined → read the token file next to ocg.json)
  * @returns the bound port number
  */
 export async function startCallbackServer(
   host: string,
   port: number,
   secret?: string,
-  options: { send?: SendRouteContext } = {},
+  options: { send?: SendRouteContext; agent?: AgentRouteContext; localToken?: string | null } = {},
 ): Promise<number> {
   if (server) {
     console.warn("[ocg] callback server already running");
@@ -311,12 +272,15 @@ export async function startCallbackServer(
 
   _callbackSecret = secret ?? null;
   const sendCtx = options.send ?? defaultSendRouteContext();
+  const agentCtx = options.agent ?? defaultAgentRouteContext();
+  const authOptions = agentRouteAuthOptions(agentCtx, isWildcardHost(host));
+  if (options.localToken !== undefined) authOptions.localToken = options.localToken;
 
   server = createServer(async (req, res) => {
-    // CORS for agent backends on other ports
+    // CORS for agent backends on other ports / hosts
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-OCG-Signature");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-OCG-Signature, X-OCG-Local-Token");
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -324,19 +288,35 @@ export async function startCallbackServer(
       return;
     }
 
-    const url = req.url ?? "/";
+    const rawUrl = req.url ?? "/";
+    let requestUrl: URL;
+    try {
+      requestUrl = new URL(rawUrl, "http://localhost");
+    } catch {
+      jsonBody(res, 400, { error: "malformed request URL" });
+      return;
+    }
+    const pathname = requestUrl.pathname;
 
     // Route: POST /ocg/send (proactive send)
-    if (req.method === "POST" && /^\/ocg\/send(?:\?.*)?$/.test(url)) {
-      await handleSendRequest(req, res, sendCtx);
+    if (req.method === "POST" && pathname === "/ocg/send") {
+      await handleSendRequest(req, res, sendCtx, {
+        localToken: authOptions.localToken,
+        localTokenLoopbackOnly: authOptions.localTokenLoopbackOnly,
+      });
+      return;
+    }
+
+    // Routes: /ocg/health, /ocg/inbox*, /ocg/targets (agent CLI surface)
+    if (await handleAgentRoutes(req, res, requestUrl, agentCtx, authOptions)) {
       return;
     }
 
     // Route: POST /ocg/callback/{token}
-    const match = url.match(/^\/ocg\/callback\/([a-f0-9]{64})(?:\?.*)?$/);
+    const match = pathname.match(/^\/ocg\/callback\/([a-f0-9]{64})$/);
 
     if (req.method !== "POST" || !match) {
-      if (req.method === "POST" && url === "/ocg/callback") {
+      if (req.method === "POST" && pathname === "/ocg/callback") {
         // Backward-compat hint for old agent runtimes
         jsonBody(res, 400, {
           error: "callback token must be in URL path: POST /ocg/callback/{token}",
@@ -355,7 +335,7 @@ export async function startCallbackServer(
       // HMAC verification (if secret is configured)
       if (_callbackSecret) {
         const sigHeader = req.headers["x-ocg-signature"] as string | undefined;
-        if (!verifyHmac(rawBody, sigHeader, _callbackSecret)) {
+        if (!verifyHmacSignature(rawBody, sigHeader, _callbackSecret)) {
           console.warn("[ocg] callback HMAC verification failed");
           jsonBody(res, 401, { error: "signature verification failed" });
           return;
@@ -421,6 +401,16 @@ export async function startCallbackServer(
         }
       } catch {
         // Settings are advisory at startup; the route re-resolves them per request.
+      }
+      try {
+        if (agentCtx.isMailboxEnabled()) {
+          const stats = agentCtx.getMailbox().stats();
+          console.log(
+            `[ocg] Mailbox mode enabled — pull messages with "ocg inbox wait" (pending: ${stats.pending})`,
+          );
+        }
+      } catch {
+        // Mailbox is advisory at startup too.
       }
       resolve(_boundPort);
     });

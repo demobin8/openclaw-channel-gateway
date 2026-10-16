@@ -3,6 +3,7 @@
  */
 
 import { loadConfig, buildOpenClawConfig, applyConfigEnvOverrides, type LiteGatewayConfig } from "./config.js";
+import { ensureLocalToken } from "./local-auth.js";
 import {
   loadAllPlugins,
   startChannel as loadStartChannel,
@@ -82,8 +83,15 @@ export async function startAll(
 
   applyConfigEnvOverrides(rawCfg);
 
-  // Start callback server for async dispatch (only if not already running)
+  // Start callback server for async dispatch (only if not already running).
+  // The daemon also generates/reads the local token here so CLI commands can
+  // authenticate against the agent routes (techdesign §5.9).
   if (!isCallbackServerRunning()) {
+    try {
+      ensureLocalToken();
+    } catch (err) {
+      console.warn(`[ocg] Failed to prepare local token: ${(err as Error).message}`);
+    }
     const cbHost = rawCfg.callbackHost ?? "0.0.0.0";
     const cbPort = rawCfg.callbackPort ?? 3457;
     try {
