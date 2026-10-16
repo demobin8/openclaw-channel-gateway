@@ -377,6 +377,30 @@ export class Mailbox {
   }
 
   /**
+   * Hand leased messages back to the queue without counting a redelivery —
+   * used when a `wait` response could not be delivered to the consumer that
+   * was granted the lease (client disconnected first). Only leases held by
+   * `consumer` are released; anything else is left untouched.
+   */
+  release(ids: string[], consumer: string): number {
+    let released = 0;
+    for (const id of ids) {
+      const entry = this.entries.get(id);
+      if (!entry || entry.state !== "leased" || entry.consumer !== consumer) continue;
+      entry.state = "pending";
+      entry.consumer = null;
+      entry.leaseExpiresAt = null;
+      this.appendLogState(entry);
+      released += 1;
+    }
+    if (released > 0) {
+      this.log(`released ${released} lease(s) held by consumer="${consumer}" (client disconnected)`);
+      this.wakeWaiters();
+    }
+    return released;
+  }
+
+  /**
    * Take (consume) the reply handle — single-use, like `/ocg/callback`.
    * Returns null when absent, expired, or gone after a daemon restart.
    */
@@ -560,6 +584,34 @@ export class Mailbox {
     this.handles.delete(entry.id);
     this.appendLogState(entry);
     this.log(`done id=${entry.id} by=${doneBy}`);
+    this.evictDone();
+  }
+
+  /**
+   * Bound the in-memory history: keep at most `maxDone` done entries (oldest
+   * `doneAt` first to go). Evicted entries are recorded as `drop` so a replay
+   * reaches the same state; the snapshot written by the next compaction then
+   * no longer carries them. `mailboxHistoryRetentionDays` still applies as the
+   * time bound — this is the size bound (review finding 2).
+   */
+  private evictDone(): void {
+    const max = this.settings.maxDone;
+    if (max < 0) return;
+    let done = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.state === "done") done += 1;
+    }
+    if (done <= max) return;
+
+    const victims = [...this.entries.values()]
+      .filter((entry) => entry.state === "done")
+      .sort((a, b) => (a.doneAt ?? a.receivedAt) - (b.doneAt ?? b.receivedAt))
+      .slice(0, done - max);
+    for (const victim of victims) {
+      this.entries.delete(victim.id);
+      this.appendLog({ type: "drop", t: this.now(), id: victim.id, reason: "done-evicted" });
+    }
+    this.log(`evicted ${victims.length} done entr(ies) beyond mailboxMaxDone=${max}`);
   }
 
   private appendLogState(entry: StoredEntry): void {
@@ -708,6 +760,9 @@ export class Mailbox {
     this.entries = entries;
     this.targetIndex = targets;
     this.log(`replayed ${entries.size} entr(ies) from ${this.logPath}`);
+    // A log written under a larger (or absent) cap may carry more history than
+    // the current settings allow.
+    this.evictDone();
   }
 
   private runRetention(now: number): void {

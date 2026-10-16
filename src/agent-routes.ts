@@ -10,9 +10,11 @@
  *   GET  /ocg/targets
  *
  * Every route accepts either the local token (`X-OCG-Local-Token`, loopback
- * only when the server binds a wildcard host) or the existing HMAC signature
- * (`X-OCG-Signature`, signing an empty body for GETs).  Error responses use the
- * common `{ ok:false, code, message, hint? }` shape.
+ * only when the server binds a wildcard host) or an HMAC signature
+ * (`X-OCG-Signature`).  Signatures bind method, path and a timestamp
+ * (`X-OCG-Timestamp`, see `verifySignedRequest`); POST routes additionally
+ * accept the legacy body-only form.  Error responses use the common
+ * `{ ok:false, code, message, hint? }` shape.
  *
  * See docs/techdesign-agent-cli.md §5.5 / §5.6.
  */
@@ -30,7 +32,7 @@ import {
   type SendSettings,
 } from "./config.js";
 import { ensureMailbox, type Mailbox, type MailboxState } from "./mailbox.js";
-import { isLoopbackAddress, localTokenMatches, readLocalToken, verifyHmacSignature } from "./local-auth.js";
+import { isLoopbackAddress, localTokenMatches, readLocalToken, verifySignedRequest } from "./local-auth.js";
 import { jsonBody, readBodyLimited } from "./http-util.js";
 import { deliverPayloadInChunks, resolveReplyChunkSize, rewriteLocalMediaPathsForDelivery } from "./reply-chunking.js";
 import { executeSend } from "./send-service.js";
@@ -111,6 +113,8 @@ export type RouteAuthOptions = {
   localTokenLoopbackOnly: boolean;
   /** Secret for `X-OCG-Signature` verification (sendSecret ?? callbackSecret). */
   hmacSecret: string | null;
+  /** Clock source for the timestamp window (tests). */
+  now?: () => number;
 };
 
 export type RouteAuthResult =
@@ -121,6 +125,7 @@ export function authorizeRequest(
   req: IncomingMessage,
   rawBody: Buffer,
   options: RouteAuthOptions,
+  url?: URL,
 ): RouteAuthResult {
   const tokenHeader = req.headers["x-ocg-local-token"];
   const provided = typeof tokenHeader === "string" ? tokenHeader : undefined;
@@ -143,8 +148,33 @@ export function authorizeRequest(
 
   if (options.hmacSecret) {
     const signature = req.headers["x-ocg-signature"];
-    if (verifyHmacSignature(rawBody, typeof signature === "string" ? signature : undefined, options.hmacSecret)) {
-      return { ok: true, via: "hmac" };
+    const timestamp = req.headers["x-ocg-timestamp"];
+    const requestUrl = url ?? new URL(req.url ?? "/", "http://localhost");
+    const verdict = verifySignedRequest({
+      secret: options.hmacSecret,
+      method: req.method ?? "GET",
+      pathWithQuery: `${requestUrl.pathname}${requestUrl.search}`,
+      rawBody,
+      signatureHeader: typeof signature === "string" ? signature : undefined,
+      timestampHeader: typeof timestamp === "string" ? timestamp : undefined,
+      now: options.now?.(),
+    });
+    if (verdict.ok) return { ok: true, via: "hmac" };
+    if (verdict.reason === "timestamp-required" || verdict.reason === "stale-timestamp") {
+      return {
+        ok: false,
+        status: 401,
+        body: {
+          ok: false,
+          code: "UNAUTHORIZED",
+          message: verdict.reason === "stale-timestamp"
+            ? "X-OCG-Timestamp is missing, malformed or outside the 5-minute window"
+            : "GET routes require a timestamped signature",
+          hint:
+            "send X-OCG-Timestamp (unix seconds) and sign " +
+            "\"<timestamp>\\n<METHOD>\\n<path?query>\\n\" + body with HMAC-SHA256",
+        },
+      };
     }
   }
 
@@ -321,6 +351,13 @@ async function handleInboxWait(
       signal: controller.signal,
     });
     if (controller.signal.aborted) {
+      // The client went away between the lease being granted and the response
+      // being written. Nobody received these messages, so hand them straight
+      // back to the queue instead of letting them sit leased for a full
+      // mailboxLeaseMs (review finding 4).
+      if (!peek && result.messages.length > 0) {
+        mailbox.release(result.messages.map((message) => message.id), consumer);
+      }
       try {
         res.end();
       } catch {
@@ -550,6 +587,26 @@ async function handleReply(
     });
 
     if (outcome.body.ok !== true) {
+      // Addressing failures on the degraded path mean "this peer can no longer
+      // be reached by a proactive send" — surface them as REPLY_EXPIRED so the
+      // CLI maps them to a delivery failure (exit 1), not to "bad arguments"
+      // (UNKNOWN_CHANNEL is a 404 in the send contract; review finding 5).
+      const sendCode = typeof outcome.body.code === "string" ? outcome.body.code : "";
+      if (sendCode === "UNKNOWN_CHANNEL" || sendCode === "UNKNOWN_ACCOUNT" || sendCode === "INVALID_TARGET") {
+        const reason = sendCode === "UNKNOWN_CHANNEL"
+          ? `channel "${entry.channel}" is not allowed for proactive send (sendAllowedChannels)`
+          : String(outcome.body.message ?? sendCode);
+        respondError(res, 410, "REPLY_EXPIRED", `reply window expired and the peer cannot be reached by send: ${reason}`, {
+          id,
+          via: "send",
+          send: outcome.body,
+          hint: sendCode === "UNKNOWN_CHANNEL"
+            ? `add "${entry.channel}" to sendAllowedChannels, or reply within replyExpiresAt`
+            : "reply within replyExpiresAt next time; the recorded target is not addressable",
+          ...(notes.length > 0 ? { notes } : {}),
+        });
+        return;
+      }
       jsonBody(res, outcome.httpStatus, {
         ...outcome.body,
         id,
@@ -649,7 +706,7 @@ export async function handleAgentRoutes(
     rawBody = read.raw;
   }
 
-  const authorized = authorizeRequest(req, rawBody, auth);
+  const authorized = authorizeRequest(req, rawBody, auth, url);
   if (!authorized.ok) {
     jsonBody(res, authorized.status, authorized.body);
     return true;

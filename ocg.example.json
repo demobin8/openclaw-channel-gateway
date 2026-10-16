@@ -20,7 +20,7 @@
   "_sendChunkPrefix": false,
 
   "_mailbox": "Mailbox mode: agents pull inbound messages with `ocg inbox wait` and answer with `ocg reply` (see docs/techdesign-agent-cli.md).",
-  "_mailboxExample": "Set agentType to \"mailbox\" (globally, or per channel via channels.<id>.agentType). Optional: mailboxLeaseMs (300000), mailboxReplyTTL (seconds, default callbackTokenTTL), mailboxMaxPending (1000), mailboxMaxRedeliveries (5), mailboxDownloadMedia (true), mailboxMediaRetentionDays (7), mailboxHistoryRetentionDays (30).",
+  "_mailboxExample": "Set agentType to \"mailbox\" (globally, or per channel via channels.<id>.agentType). Optional: mailboxLeaseMs (300000), mailboxReplyTTL (seconds, default callbackTokenTTL), mailboxMaxPending (1000), mailboxMaxRedeliveries (5), mailboxDownloadMedia (true), mailboxMediaRetentionDays (7), mailboxHistoryRetentionDays (30), mailboxMaxDone (2000; -1 = unbounded).",
   "_mailboxSetup": "On the agent side: ocg daemon start && ocg skill install && ocg inbox wait --json",
 
   "_async": "Uncomment below for async fire-and-forget mode:",

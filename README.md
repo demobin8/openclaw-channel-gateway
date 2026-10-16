@@ -427,7 +427,8 @@ ocg skill show             # print the same content
   "mailboxMaxRedeliveries": 5,         // lease expiries before a message is marked expired
   "mailboxDownloadMedia": true,        // download remote media URLs into <configDir>/mailbox/media/
   "mailboxMediaRetentionDays": 7,
-  "mailboxHistoryRetentionDays": 30    // JSONL log retention
+  "mailboxHistoryRetentionDays": 30,   // JSONL log retention (time bound)
+  "mailboxMaxDone": 2000               // done entries kept in memory/snapshot (size bound; -1 = unbounded)
 }
 ```
 
@@ -441,8 +442,19 @@ Everything the CLI does is available over HTTP on the callback server
 (`POST /ocg/send` included): `GET /ocg/health`, `/ocg/inbox`, `/ocg/inbox/wait`,
 `/ocg/inbox/{id}`, `POST /ocg/inbox/{id}/ack|reply`, `GET /ocg/targets`.
 Authenticate with the local token (generated at `<configDir>/ocg-local-token`,
-accepted from loopback only when bound to `0.0.0.0`) or the usual
-`X-OCG-Signature` HMAC.
+accepted from loopback only when bound to `0.0.0.0`) or an `X-OCG-Signature`
+HMAC. For these routes the signature must be **timestamped**: send
+`X-OCG-Timestamp` (unix seconds, within 5 minutes of the daemon clock) and sign
+`"<timestamp>\n<METHOD>\n<path?query>\n" + body` with HMAC-SHA256. POST
+routes also accept the legacy body-only signature that `/ocg/send` uses; GET
+routes do not (a body-only signature over an empty body would be a permanent
+bearer token for every read route).
+
+```bash
+TS=$(date +%s); PATHQ="/ocg/inbox/wait?timeoutMs=30000&consumer=remote"
+SIG=$(printf '%s\nGET\n%s\n' "$TS" "$PATHQ" | openssl dgst -sha256 -hmac "shared-secret" -hex | sed 's/.*= //')
+curl "http://gateway:3457$PATHQ" -H "X-OCG-Timestamp: $TS" -H "X-OCG-Signature: sha256=$SIG"
+```
 
 ### Exit codes (inbox/reply)
 

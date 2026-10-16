@@ -104,3 +104,87 @@ export function verifyHmacSignature(
   if (received.length !== expectedBuf.length) return false;
   return timingSafeEqual(received, expectedBuf);
 }
+
+/** Accepted clock skew for timestamped request signatures (5 minutes). */
+export const SIGNED_REQUEST_MAX_SKEW_MS = 5 * 60_000;
+
+/**
+ * Canonical bytes for a timestamped request signature:
+ *
+ *   `<unix-seconds>\n<METHOD>\n<path?query>\n` + raw body
+ *
+ * Binding method, path and time to the signature means a captured
+ * `X-OCG-Signature` cannot be replayed against another route or after the
+ * skew window — a body-only signature over an empty GET body would otherwise
+ * be a permanent bearer token for every read route.
+ */
+export function buildSignedRequestPayload(
+  timestamp: string,
+  method: string,
+  pathWithQuery: string,
+  rawBody: Buffer,
+): Buffer {
+  return Buffer.concat([
+    Buffer.from(`${timestamp}\n${method.toUpperCase()}\n${pathWithQuery}\n`, "utf8"),
+    rawBody,
+  ]);
+}
+
+/** Produce the `X-OCG-Signature` value for a timestamped request (clients / tests). */
+export function signRequest(
+  secret: string,
+  timestamp: string,
+  method: string,
+  pathWithQuery: string,
+  rawBody: Buffer = Buffer.alloc(0),
+): string {
+  const digest = createHmac("sha256", secret)
+    .update(buildSignedRequestPayload(timestamp, method, pathWithQuery, rawBody))
+    .digest("hex");
+  return `sha256=${digest}`;
+}
+
+export type SignedRequestVerdict =
+  | { ok: true; mode: "timestamped" | "body" }
+  | { ok: false; reason: "missing" | "bad-signature" | "stale-timestamp" | "timestamp-required" };
+
+/**
+ * Verify a request-level HMAC signature.
+ *
+ * - With `X-OCG-Timestamp` present: the signature must cover
+ *   `buildSignedRequestPayload(...)` and the timestamp must be within
+ *   {@link SIGNED_REQUEST_MAX_SKEW_MS} of `now`.
+ * - Without it: only non-GET requests may fall back to the legacy body-only
+ *   signature (what `/ocg/send` has always accepted). GET requests have no
+ *   body to bind, so they require the timestamped form.
+ */
+export function verifySignedRequest(params: {
+  secret: string;
+  method: string;
+  pathWithQuery: string;
+  rawBody: Buffer;
+  signatureHeader: string | undefined;
+  timestampHeader: string | undefined;
+  now?: number;
+}): SignedRequestVerdict {
+  const { secret, method, pathWithQuery, rawBody, signatureHeader, timestampHeader } = params;
+  if (!signatureHeader) return { ok: false, reason: "missing" };
+
+  if (timestampHeader !== undefined && timestampHeader !== "") {
+    const seconds = Number(timestampHeader);
+    if (!Number.isFinite(seconds)) return { ok: false, reason: "stale-timestamp" };
+    const now = params.now ?? Date.now();
+    if (Math.abs(now - seconds * 1000) > SIGNED_REQUEST_MAX_SKEW_MS) {
+      return { ok: false, reason: "stale-timestamp" };
+    }
+    const payload = buildSignedRequestPayload(timestampHeader, method, pathWithQuery, rawBody);
+    return verifyHmacSignature(payload, signatureHeader, secret)
+      ? { ok: true, mode: "timestamped" }
+      : { ok: false, reason: "bad-signature" };
+  }
+
+  if (method.toUpperCase() === "GET") return { ok: false, reason: "timestamp-required" };
+  return verifyHmacSignature(rawBody, signatureHeader, secret)
+    ? { ok: true, mode: "body" }
+    : { ok: false, reason: "bad-signature" };
+}

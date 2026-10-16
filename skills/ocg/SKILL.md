@@ -3,7 +3,7 @@ name: ocg
 description: Read and reply to IM messages (QQ/Telegram/WeChat/DingTalk/Discord) through a local OpenClaw Channel Gateway (OCG) daemon. Use when the user asks to check incoming messages, answer an IM conversation, or send an IM message to a previously seen contact/group.
 ---
 
-# OCG — IM mailbox for coding agents (v1.3.0)
+# OCG — IM mailbox for coding agents (v1.3.1)
 
 OCG runs as a local daemon ("gateway") connected to the user's IM channels
 (QQ Bot, Telegram, WeChat, DingTalk, Discord). In **mailbox mode** incoming

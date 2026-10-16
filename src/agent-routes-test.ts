@@ -19,6 +19,7 @@ import {
 } from "./agent-routes.js";
 import { startCallbackServer, stopCallbackServer } from "./callback-server.js";
 import { buildOpenClawConfig, resolveMailboxSettings, resolveSendSettings, type LiteGatewayConfig } from "./config.js";
+import { signRequest } from "./local-auth.js";
 import { Mailbox, newMessageId, type InboundMessage } from "./mailbox.js";
 
 // ── Harness ────────────────────────────────────────────────────────────────
@@ -118,13 +119,14 @@ async function main(): Promise<void> {
   };
   const sendSettings = resolveSendSettings(raw);
   let mailboxEnabled = true;
+  let sendAllowedOverride: string[] | null = null;
 
   const agentCtx: AgentRouteContext = {
     getRawConfig: () => raw,
     getConfig: () => buildOpenClawConfig(raw),
     getMailbox: () => mailbox,
     isMailboxEnabled: () => mailboxEnabled,
-    getSendSettings: () => sendSettings,
+    getSendSettings: () => ({ ...sendSettings, allowedChannels: sendAllowedOverride ?? sendSettings.allowedChannels }),
     getLocalToken: () => "test-token",
     getChannelsStatus: () => [{ id: "mock", accountId: "default", status: "running" }],
     getPlugin: () => plugin as never,
@@ -159,11 +161,43 @@ async function main(): Promise<void> {
     check("health carries version", okBody.version === "0.0.0-test");
     check("health carries channels", Array.isArray(okBody.channels) && (okBody.channels as unknown[]).length === 1, okBody.channels);
 
-    const signature = `sha256=${createHmac("sha256", "route-secret").update("").digest("hex")}`;
-    const hmac = await fetchNoKeepAlive(`${base}/ocg/health`, {
-      headers: { "X-OCG-Signature": signature },
+    // Body-only HMAC over an empty GET body would be a permanent bearer token
+    // for every read route — GETs must carry a timestamped signature.
+    const bodyOnly = `sha256=${createHmac("sha256", "route-secret").update("").digest("hex")}`;
+    const legacyGet = await fetchNoKeepAlive(`${base}/ocg/health`, {
+      headers: { "X-OCG-Signature": bodyOnly },
     });
-    check("HMAC (empty body) → 200", hmac.status === 200, hmac.status);
+    const legacyGetBody = await legacyGet.json() as Record<string, unknown>;
+    check("HMAC body-only on GET → 401", legacyGet.status === 401 && legacyGetBody.code === "UNAUTHORIZED", legacyGetBody);
+
+    const ts = String(Math.floor(Date.now() / 1000));
+    const signedGet = await fetchNoKeepAlive(`${base}/ocg/health`, {
+      headers: { "X-OCG-Signature": signRequest("route-secret", ts, "GET", "/ocg/health"), "X-OCG-Timestamp": ts },
+    });
+    check("HMAC timestamped GET → 200", signedGet.status === 200, signedGet.status);
+
+    const wrongPath = await fetchNoKeepAlive(`${base}/ocg/inbox?state=all`, {
+      headers: { "X-OCG-Signature": signRequest("route-secret", ts, "GET", "/ocg/health"), "X-OCG-Timestamp": ts },
+    });
+    check("signature for another path → 401", wrongPath.status === 401, wrongPath.status);
+
+    const staleTs = String(Math.floor(Date.now() / 1000) - 600);
+    const stale = await fetchNoKeepAlive(`${base}/ocg/health`, {
+      headers: { "X-OCG-Signature": signRequest("route-secret", staleTs, "GET", "/ocg/health"), "X-OCG-Timestamp": staleTs },
+    });
+    check("stale timestamp → 401", stale.status === 401, stale.status);
+
+    // POST keeps accepting the legacy body-only signature (same as /ocg/send).
+    const ackBody = JSON.stringify({ force: true });
+    const legacyPost = await fetchNoKeepAlive(`${base}/ocg/inbox/m_nope/ack`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-OCG-Signature": `sha256=${createHmac("sha256", "route-secret").update(ackBody).digest("hex")}`,
+      },
+      body: ackBody,
+    });
+    check("HMAC body-only on POST still authenticates (404 past auth)", legacyPost.status === 404, legacyPost.status);
 
     // Loopback restriction — unit level, since a local socket IS loopback.
     const fakeReq = (remoteAddress: string): IncomingMessage => ({
@@ -264,6 +298,51 @@ async function main(): Promise<void> {
     });
     const expiredBody = await expired.json() as Record<string, unknown>;
     check("no target → 410 REPLY_EXPIRED", expired.status === 410 && expiredBody.code === "REPLY_EXPIRED", expiredBody);
+
+    // Channel not in sendAllowedChannels → the send contract says 404
+    // UNKNOWN_CHANNEL; on the reply path that must read as REPLY_EXPIRED.
+    sendAllowedOverride = ["other"];
+    const blocked = mailbox.enqueue(makeMessage({ text: "blocked", target: "mock:c2c:abc123" }));
+    const blockedRes = await fetchNoKeepAlive(`${base}/ocg/inbox/${blocked.id}/reply`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ text: "late" }),
+    });
+    const blockedBody = await blockedRes.json() as Record<string, unknown>;
+    sendAllowedOverride = null;
+    check("disallowed channel → 410 REPLY_EXPIRED", blockedRes.status === 410 && blockedBody.code === "REPLY_EXPIRED", blockedBody);
+    check("degraded failure carries the send outcome", (blockedBody.send as Record<string, unknown> | undefined)?.code === "UNKNOWN_CHANNEL", blockedBody.send);
+    check("degraded failure leaves the entry open", mailbox.get(blocked.id)?.state !== "done", mailbox.get(blocked.id));
+  }
+
+  // ── 4b. wait: client disconnects after the lease → messages released ────
+  section("4b. /ocg/inbox/wait abort releases the lease");
+  {
+    while (mailbox.stats().pending > 0) {
+      await mailbox.wait({ consumer: "drain", max: 50, timeoutMs: 50 });
+    }
+    const controller = new AbortController();
+    const pending = fetchNoKeepAlive(`${base}/ocg/inbox/wait?timeoutMs=5000&consumer=gone`, {
+      headers: auth,
+      signal: controller.signal,
+    }).catch(() => null);
+    await sleep(250);
+    controller.abort();
+    await pending;
+    await sleep(150);
+    const late = mailbox.enqueue(makeMessage({ text: "after abort" }));
+    await sleep(100);
+    check("message enqueued after abort stays pending", mailbox.get(late.id)?.state === "pending", mailbox.get(late.id));
+
+    // Lease granted, then the client vanishes before the body is written:
+    // exercise the Mailbox API the handler uses for that case (release).
+    const leased = await mailbox.wait({ consumer: "gone", timeoutMs: 50 });
+    check("leased to gone", leased.messages[0]?.id === late.id && mailbox.get(late.id)?.state === "leased");
+    const released = mailbox.release([late.id], "gone");
+    const after = mailbox.get(late.id);
+    check("release → pending, no redelivery counted", released === 1 && after?.state === "pending" && after?.redeliveries === 0, after);
+    check("release by non-holder is a no-op", mailbox.release([late.id], "someone") === 0);
+    mailbox.ack(late.id, { force: true });
   }
 
   // ── 5. ack: lease conflict + force ──────────────────────────────────────

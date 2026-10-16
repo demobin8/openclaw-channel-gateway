@@ -213,6 +213,34 @@ async function main(): Promise<void> {
     mailbox2.dispose();
   }
 
+  // ── 7b. done cap evicts the oldest done entries (memory bound) ──────────
+  section("7b. mailboxMaxDone eviction + replay");
+  {
+    const dir = freshDir();
+    const mailbox = new Mailbox({ dir, settings: makeSettings({ maxDone: 2 }), startTimers: false, log: () => {} });
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      const entry = mailbox.enqueue(makeMessage({ text: `d${i}` }));
+      ids.push(entry.id);
+      mailbox.ack(entry.id, { force: true });
+    }
+    check("only maxDone entries kept", mailbox.stats().done === 2, mailbox.stats());
+    check("oldest done evicted", mailbox.get(ids[0]) === null && mailbox.get(ids[1]) === null);
+    check("newest done kept", mailbox.get(ids[2])?.state === "done" && mailbox.get(ids[3])?.state === "done");
+    check("pending unaffected by eviction", mailbox.enqueue(makeMessage({ text: "live" })).state === "pending");
+    mailbox.dispose();
+
+    const replayed = new Mailbox({ dir, settings: makeSettings({ maxDone: 1 }), startTimers: false, log: () => {} });
+    check("replay honours a tighter cap", replayed.stats().done === 1 && replayed.get(ids[3])?.state === "done", replayed.stats());
+    check("replay keeps the live message", replayed.stats().pending === 1);
+    replayed.dispose();
+
+    const unbounded = new Mailbox({ dir: freshDir(), settings: makeSettings({ maxDone: -1 }), startTimers: false, log: () => {} });
+    for (let i = 0; i < 5; i += 1) unbounded.ack(unbounded.enqueue(makeMessage()).id, { force: true });
+    check("maxDone -1 keeps everything", unbounded.stats().done === 5);
+    unbounded.dispose();
+  }
+
   // ── 8. queue cap drops the oldest pending ────────────────────────────────
   section("8. queue cap");
   {

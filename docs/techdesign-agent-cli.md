@@ -1,6 +1,6 @@
 # 技术设计：OCG Agent CLI（mailbox 传输 + daemon 薄客户端）
 
-> 状态：**草案 v0.1**
+> 状态：**已实现（OCG `1.3.0`）；评审修订已落地（`1.3.1`）**
 >
 > 日期：2026-10-16
 >
@@ -360,7 +360,8 @@ SKILL.md 大纲（frontmatter `name: ocg`，`description` 一句话说明何时�
   "mailboxMaxRedeliveries": 5,
   "mailboxDownloadMedia": true,
   "mailboxMediaRetentionDays": 7,
-  "mailboxHistoryRetentionDays": 30   // JSONL 滚动保留
+  "mailboxHistoryRetentionDays": 30,  // JSONL 滚动保留（时间上限）
+  "mailboxMaxDone": 2000              // 内存/快照中的 done 条目数量上限（1.3.1；-1 不限）
 }
 ```
 
@@ -419,6 +420,7 @@ SKILL.md 大纲（frontmatter `name: ocg`，`description` 一句话说明何时�
 | --- | --- | --- |
 | v0.1 | 2026-10-16 | 初稿 |
 | v0.2 | 2026-10-16 | 实现落地（1.3.0）；§12 记录实现注记与偏差 |
+| v0.3 | 2026-10-16 | 评审修订（1.3.1）：§13 |
 
 ## 12. 实现注记（1.3.0）
 
@@ -435,3 +437,16 @@ SKILL.md 大纲（frontmatter `name: ocg`，`description` 一句话说明何时�
 9. **HMAC 对 GET 路由签空 body**（`sha256=<HMAC("")>`），POST 路由签原始字节；`/ocg/callback` 行为完全不变。
 10. **`ocg send` 走 daemon 时 `--chunk-prefix` 不适用**（HTTP 契约无此字段）：带该 flag 时直接走进程内实现。
 
+## 13. 评审修订（1.3.1）
+
+1.3.0 评审（见 CHANGELOG 1.3.1）发现的问题与处理：
+
+| # | 问题 | 处理 |
+| --- | --- | --- |
+| 1 | HMAC 对 GET 路由只签空 body，`sha256=HMAC("")` 等于一个永久只读 bearer token，且 `/ocg/inbox/wait` 会消费消息 | 新增**带时间戳的请求签名**：`X-OCG-Timestamp`（unix 秒，±5 分钟）+ 对 `"<ts>\n<METHOD>\n<path?query>\n" + body` 签名（`local-auth.ts` `verifySignedRequest`）。GET 路由只接受该形式；POST 路由兼容只签 body 的旧形式；`/ocg/send`、`/ocg/callback` 不变 |
+| 2 | done 条目按 30 天全量常驻内存，并整体写入快照 | 新增 `mailboxMaxDone`（默认 2000，`-1` 不限）：超出时按 `doneAt` 淘汰最旧的 done 条目并写 `drop` 记录；replay 后也按当前上限淘汰 |
+| 3 | `ocg chat` / `ocg test` 在 mailbox 配置下会在 CLI 进程里新建 Mailbox、compact daemon 的 JSONL，并留下一条无法回复的 `terminal` 消息 | `chat` 解析到 `mailbox` 时直接拒绝（退出 2，提示 `--agent-type http\|acp`）；`test` 固定 `OCG_AGENT_TYPE=http` |
+| 4 | `wait` 在租约已分配、响应未写出时客户端断开，消息会被租住整个 `mailboxLeaseMs` | 新增 `Mailbox.release(ids, consumer)`：放回 pending、不计 redelivery；`handleInboxWait` 的 aborted 分支调用它 |
+| 5 | 降级发送因 `sendAllowedChannels` 被拒时返回 `404 UNKNOWN_CHANNEL`，CLI 映射为退出 2（"参数错误"） | 降级路径把 `UNKNOWN_CHANNEL` / `UNKNOWN_ACCOUNT` / `INVALID_TARGET` 统一改写为 `410 REPLY_EXPIRED`（退出 1），响应里保留原始 `send` 结果与 hint |
+| 6 | `ocg daemon start` 遇到已运行的 daemon 退出 3，而 3 在其他地方表示"daemon 不可用" | 改为退出 0，输出 `{ ok:true, alreadyRunning:true, pid, port, channels }` |
+| 7 | 真实通道（qqbot / openclaw-weixin）与 POSIX 未验证 | **未处理**，仍需人工冒烟；weixin 入口在 mailbox 模式下 `markComplete()` 后再 `sendFinalReply` 依赖插件 deliver 闭包长期有效 |

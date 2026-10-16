@@ -4,6 +4,56 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.3.1] — 2026-10-16
+
+Review follow-ups for the 1.3.0 agent CLI (docs/techdesign-agent-cli.md §13).
+
+### Security
+
+- **Agent routes require a timestamped HMAC signature.** 1.3.0 verified
+  `X-OCG-Signature` over the raw body only, so for GET routes the signature of
+  an empty body was a permanent bearer token for every read route — including
+  `/ocg/inbox/wait`, which consumes messages. Remote callers now send
+  `X-OCG-Timestamp` (unix seconds, ±5 min) and sign
+  `"<timestamp>\n<METHOD>\n<path?query>\n" + body`. POST routes still accept
+  the legacy body-only form; `/ocg/send` and `/ocg/callback` are unchanged. The
+  local token path is unaffected.
+
+### Added
+
+- `mailboxMaxDone` (default `2000`, `-1` = unbounded): size bound for done
+  entries kept in memory and in the JSONL snapshot. Previously every done entry
+  within `mailboxHistoryRetentionDays` stayed resident and was rewritten on each
+  compaction.
+- `Mailbox.release()`: when an `inbox wait` client disconnects after its lease
+  was granted but before the response was written, the messages go straight
+  back to `pending` (no redelivery counted) instead of waiting out the lease.
+
+### Changed
+
+- `ocg daemon start` against an already-running daemon now exits **0** with
+  `{ ok: true, alreadyRunning: true, pid, port, channels }` (was exit 3 /
+  `ALREADY_RUNNING`, which collides with "daemon unavailable").
+- `ocg reply` degraded path: addressing failures from the send contract
+  (`UNKNOWN_CHANNEL` from `sendAllowedChannels`, `UNKNOWN_ACCOUNT`,
+  `INVALID_TARGET`) are reported as `410 REPLY_EXPIRED` (exit 1) with the raw
+  send outcome attached, instead of a 404 that the CLI mapped to "bad arguments".
+- `ocg chat` refuses to run when the resolved transport is `mailbox` (exit 2,
+  hint to pass `--agent-type http|acp`); `ocg test` pins `OCG_AGENT_TYPE=http`.
+  Both previously created a second Mailbox in the CLI process, compacted the
+  daemon's JSONL underneath it and left an orphaned `terminal` message queued.
+
+### Tests
+
+- `agent-routes-test.ts`: body-only GET → 401, timestamped GET → 200, wrong
+  path / stale timestamp → 401, legacy POST signature still accepted;
+  disallowed channel on the degraded reply path → `REPLY_EXPIRED`; abort/release
+  semantics.
+- `mailbox-test.ts`: `mailboxMaxDone` eviction, replay under a tighter cap,
+  `-1` unbounded.
+
+---
+
 ## [1.3.0] — 2026-10-16
 
 ### Added

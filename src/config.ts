@@ -124,6 +124,11 @@ export type LiteGatewayConfig = {
   mailboxMediaRetentionDays?: number;
   /** Days to keep done entries in the mailbox JSONL log (default 30). */
   mailboxHistoryRetentionDays?: number;
+  /**
+   * Max done entries kept in memory / in the snapshot (default 2000). The
+   * oldest done entries are evicted beyond it; set -1 for unbounded.
+   */
+  mailboxMaxDone?: number;
   /** Session model (OpenClaw-compatible) */
   session?: {
     /** DM session isolation scope: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer". Defaults to "per-channel-peer". */
@@ -265,6 +270,7 @@ export const DEFAULT_MAILBOX_MAX_PENDING = 1000;
 export const DEFAULT_MAILBOX_MAX_REDELIVERIES = 5;
 export const DEFAULT_MAILBOX_MEDIA_RETENTION_DAYS = 7;
 export const DEFAULT_MAILBOX_HISTORY_RETENTION_DAYS = 30;
+export const DEFAULT_MAILBOX_MAX_DONE = 2000;
 
 /** Normalized mailbox settings derived from config (all optional keys). */
 export type MailboxSettings = {
@@ -277,6 +283,8 @@ export type MailboxSettings = {
   downloadMedia: boolean;
   mediaRetentionDays: number;
   historyRetentionDays: number;
+  /** Size bound for done entries kept in memory; -1 = unbounded. */
+  maxDone: number;
 };
 
 /**
@@ -303,6 +311,7 @@ export function resolveMailboxSettings(raw?: LiteGatewayConfig | null): MailboxS
       cfg.mailboxHistoryRetentionDays,
       DEFAULT_MAILBOX_HISTORY_RETENTION_DAYS,
     ),
+    maxDone: cfg.mailboxMaxDone === -1 ? -1 : nonNegativeInt(cfg.mailboxMaxDone, DEFAULT_MAILBOX_MAX_DONE),
   };
 }
 

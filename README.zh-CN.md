@@ -420,7 +420,8 @@ ocg skill show             # 打印同一内容
   "mailboxMaxRedeliveries": 5,         // 租约超时重投次数，超过后置为 expired
   "mailboxDownloadMedia": true,        // 把远端媒体 URL 下载到 <configDir>/mailbox/media/
   "mailboxMediaRetentionDays": 7,
-  "mailboxHistoryRetentionDays": 30    // JSONL 日志保留天数
+  "mailboxHistoryRetentionDays": 30,   // JSONL 日志保留天数（时间上限）
+  "mailboxMaxDone": 2000               // 内存/快照中保留的 done 条目数（数量上限；-1 不限）
 }
 ```
 
@@ -428,7 +429,7 @@ ocg skill show             # 打印同一内容
 
 ### HTTP 接口
 
-CLI 的每个动作都有对应的 HTTP 路由（与 `/ocg/send` 同端口）：`GET /ocg/health`、`/ocg/inbox`、`/ocg/inbox/wait`、`/ocg/inbox/{id}`、`POST /ocg/inbox/{id}/ack|reply`、`GET /ocg/targets`。鉴权用本地 token（daemon 启动时生成于 `<configDir>/ocg-local-token`；绑定 `0.0.0.0` 时仅接受回环地址）或原有的 `X-OCG-Signature` HMAC。
+CLI 的每个动作都有对应的 HTTP 路由（与 `/ocg/send` 同端口）：`GET /ocg/health`、`/ocg/inbox`、`/ocg/inbox/wait`、`/ocg/inbox/{id}`、`POST /ocg/inbox/{id}/ack|reply`、`GET /ocg/targets`。鉴权用本地 token（daemon 启动时生成于 `<configDir>/ocg-local-token`；绑定 `0.0.0.0` 时仅接受回环地址）或 `X-OCG-Signature` HMAC。这些路由的签名必须**带时间戳**：附上 `X-OCG-Timestamp`（unix 秒，与 daemon 时钟相差 5 分钟以内），对 `"<timestamp>\n<METHOD>\n<path?query>\n" + body` 做 HMAC-SHA256。POST 路由同时接受 `/ocg/send` 一直使用的"只签 body"形式；GET 路由不接受——对空 body 的签名等于一个永久有效的只读 token。
 
 ### 退出码（inbox/reply）
 

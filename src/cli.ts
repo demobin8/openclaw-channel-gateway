@@ -33,7 +33,7 @@ import {
   resolveConfigPath,
   saveConfig,
 } from "./index.js";
-import { applyConfigEnvOverrides, isMailboxConfigured, resolveSendSettings } from "./config.js";
+import { applyConfigEnvOverrides, isMailboxConfigured, resolveChannelAgentType, resolveSendSettings } from "./config.js";
 import { executeSend } from "./send-service.js";
 import { startCallbackServer, isCallbackServerRunning } from "./callback-server.js";
 import { ensureLocalToken, resolveLocalTokenPath } from "./local-auth.js";
@@ -250,6 +250,7 @@ async function cmdTest(): Promise<void> {
   console.log(`[mock-agent] Listening on http://127.0.0.1:${port}\n`);
 
   process.env.OCG_AGENT_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
+  process.env.OCG_AGENT_TYPE = "http"; // the smoke test targets the mock HTTP agent, never the mailbox
   process.env.OCG_MODEL = "gpt-4o";
   process.env.OCG_API_KEY = "test-key";
 
@@ -610,6 +611,20 @@ async function dispatchTerminalMessage(message: string, args: Args): Promise<str
 
   applyConfigEnvOverrides(rawCfg);
   const cfg = buildOpenClawConfig(rawCfg);
+
+  // Terminal chat has no mailbox consumer: enqueuing here would create a
+  // second Mailbox in this short-lived process, compact the daemon's JSONL
+  // underneath it and leave an orphaned "terminal" message behind. Force the
+  // caller to pick a push transport instead (review finding 3).
+  const chatChannel = typeof args.channel === "string" ? args.channel : undefined;
+  if (resolveChannelAgentType(chatChannel, cfg) === "mailbox") {
+    console.error(
+      "[ocg] chat cannot run in mailbox mode (messages would be queued for a daemon that is not this process).",
+    );
+    console.error("[ocg] Pass --agent-type http|acp (and --agent-url / --acp-command) to chat against an agent directly.");
+    process.exit(2);
+  }
+
   const { dispatchReplyWithBufferedBlockDispatcher } =
     await import("./shims/reply-dispatch-runtime.js");
 
@@ -1395,15 +1410,19 @@ async function cmdDaemonStart(args: Args): Promise<void> {
   const json = args["json"] === true;
   const existing = await probeDaemonHealth(resolveDaemonEndpoint(), 1500);
   if (existing) {
+    // Idempotent: a running daemon is the desired end state, so this is a
+    // success (exit 0) — exit 3 means "daemon unavailable" everywhere else and
+    // would send an agent down the wrong troubleshooting path.
     const body = {
-      ok: false,
-      code: "ALREADY_RUNNING",
+      ok: true,
+      alreadyRunning: true,
+      pid: existing.pid,
+      port: resolveDaemonEndpoint().port,
+      channels: Array.isArray(existing.channels) ? existing.channels : [],
       message: `daemon already running (pid ${String(existing.pid ?? "?")})`,
-      hint: "use: ocg daemon status",
     };
     if (json) console.log(JSON.stringify(body, null, 2));
     else console.log(`[ocg] ${body.message}`);
-    process.exitCode = 3;
     return;
   }
 
