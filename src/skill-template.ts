@@ -35,6 +35,25 @@ The daemon must be running with \`agentType: "mailbox"\` (globally or for at
 least one channel). If \`doctor\` reports the mailbox is disabled, tell the
 user — do not edit their \`ocg.json\` yourself unless asked.
 
+\`ocg daemon start\` exits 0 whether it started a daemon or found one already
+running (\`alreadyRunning: true\`). Exit 3 means it did not come up — read
+\`ocg daemon logs --tail 50\`.
+
+### First-time setup (only when the user asks for it)
+
+\`\`\`bash
+npm install -g openclaw-channel-gateway
+ocg config set agentType mailbox                       # pull mode for this skill
+ocg channels add --channel telegram --botToken "123:abc"
+ocg channels add --channel qqbot --token "AppID:AppSecret"
+ocg plugins install @tencent-weixin/openclaw-weixin    # WeChat is an external plugin
+ocg channels login --channel openclaw-weixin           # QR login (WeChat / DingTalk)
+ocg daemon start && ocg doctor
+\`\`\`
+
+Credentials come from the user; never invent or reuse tokens from elsewhere.
+\`ocg --help\` lists every command.
+
 ## Core loop
 
 \`\`\`bash
@@ -50,6 +69,38 @@ echo "long answer ..." | ocg reply m_xxxxxxxx - --json              # stdin
 ocg reply m_xxxxxxxx --text "see chart" --media https://…/chart.png --json
 ocg reply m_xxxxxxxx --text "sorry, that failed" --error --json     # marks it as an error reply
 \`\`\`
+
+### Serving continuously
+
+When the user asks you to "watch", "handle", "answer messages" or "be on duty",
+loop until they tell you to stop. A \`wait\` timeout is a normal tick, not a
+failure — just call it again:
+
+\`\`\`bash
+# One tick. Repeat it; stop only when the user says so (or after a deadline the user gave you).
+OUT=$(ocg inbox wait --timeout 60 --json)              # exit 0 even when messages=[]
+# parse OUT; for each message:
+#   - decide what the sender wants (text + media[].path for images/files)
+#   - do the work
+#   - ocg reply <id> - --json   with the answer on stdin
+# if messages=[] → loop again; report to the user only when something needs them
+\`\`\`
+
+Per tick: handle **every** message the call returned (default \`--max 1\`; use
+\`--max 5\` if the queue is backed up). Reply or \`inbox ack\` each one before the
+next \`wait\`, so leases do not pile up. When processing one message may take
+minutes, send a short acknowledgement first ("on it, back in a few minutes")
+with \`ocg reply\`, then deliver the result with \`ocg send\` to the message's
+\`target\` — one message accepts only one \`reply\`.
+
+### Writing for IM
+
+Replies land in a chat window, not a terminal: plain text, short paragraphs,
+no Markdown tables or headings (QQ and WeChat render them literally), no code
+fences unless the user asked for code. Long answers are chunked by the
+platform limit automatically; still, prefer 1–3 short messages over one wall.
+For images or files use \`--media <https-url>\`; local paths only work where the
+plugin allows them (QQ: under \`~/.openclaw/media/\`).
 
 Hints:
 
@@ -88,6 +139,11 @@ consumer:
 \`\`\`bash
 OCG_CONSUMER=worker-1 ocg inbox wait --timeout 60 --json
 \`\`\`
+
+If you delegate to sub-agents, give each its own \`OCG_CONSUMER\` and pass the
+message \`id\` along — the sub-agent replies with \`ocg reply <id> --consumer
+<its-name>\` (or you reply on its behalf; the lease holder check only blocks a
+*different* consumer, and \`--force\` overrides it).
 
 Useful extras:
 
@@ -135,5 +191,10 @@ Every \`--json\` command returns one object: \`{ok:true, …}\` or
 - Don't retry platform errors automatically.
 - Don't paste message contents into public logs, commits or shared files —
   messages are private user data.
+- Don't answer on the user's behalf about things you cannot verify (money,
+  commitments, personal matters) — reply that you will check with them, then
+  ask the user.
+- Don't run \`ocg channels remove\`, \`ocg config set\` or \`ocg plugins install\`
+  unless the user asked for exactly that change.
 `;
 }
