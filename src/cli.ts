@@ -35,8 +35,7 @@ import {
 } from "./index.js";
 import { applyConfigEnvOverrides, isMailboxConfigured, resolveChannelAgentType, resolveSendSettings } from "./config.js";
 import { executeSend } from "./send-service.js";
-import { startCallbackServer, isCallbackServerRunning } from "./callback-server.js";
-import { ensureLocalToken, resolveLocalTokenPath } from "./local-auth.js";
+import { resolveLocalTokenPath } from "./local-auth.js";
 import {
   DEFAULT_DAEMON_HOST,
   daemonRequest,
@@ -63,6 +62,7 @@ import {
   restartChannel,
   getChannelStatus,
   ensurePluginsLoaded,
+  ensureCallbackServer,
 } from "./gateway.js";
 import {
   listLoadedPlugins,
@@ -907,21 +907,11 @@ async function cmdChannelsStart(args: Args): Promise<void> {
   }
   applyConfigEnvOverrides(rawCfg);
 
-  // Start callback server for async dispatch (only if not already running).
-  // Prepare the local token first so agent routes are reachable by the CLI.
-  if (!isCallbackServerRunning()) {
-    try {
-      ensureLocalToken();
-    } catch (err) {
-      console.warn(`[ocg] Failed to prepare local token: ${(err as Error).message}`);
-    }
-    const cbHost = rawCfg.callbackHost ?? "0.0.0.0";
-    const cbPort = rawCfg.callbackPort ?? 3457;
-    try {
-      await startCallbackServer(cbHost, cbPort, rawCfg.callbackSecret);
-    } catch (err) {
-      console.error(`[ocg] Failed to start callback server: ${(err as Error).message}`);
-    }
+  try {
+    await ensureCallbackServer(rawCfg);
+  } catch (err) {
+    console.error(`[ocg] ${(err as Error).message}`);
+    process.exit(1);
   }
 
   const cfg = buildOpenClawConfig(rawCfg);
@@ -1102,7 +1092,9 @@ async function cmdChannelsLogin(args: Args): Promise<void> {
       console.log(`[ocg] Credentials saved to config`);
     }
 
-    console.log(`[ocg] Now start the channel: ocg channels start --channel ${channelId}`);
+    console.log(
+      `[ocg] Login saved. Restart the gateway (or start it with \`ocg start\` if it is not running) so it picks up the new account.`,
+    );
   } else {
     console.error(`[ocg] Login failed: ${waitResult.message ?? "timeout or cancelled"}`);
     process.exit(1);

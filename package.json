@@ -1,6 +1,6 @@
 {
   "name": "openclaw-channel-gateway",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "OpenClaw IM channel gateway — bridge Telegram/Discord/WeChat/DingTalk/QQ to any OpenAI-compatible agent API",
   "type": "module",
   "main": "dist/index.js",
@@ -19,7 +19,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --import ./dist/loader.js dist/cli.js",
     "cli": "node bin/ocg.cjs",
-    "test": "tsx src/send-test.ts && tsx src/dispatch-test.ts && tsx src/acp-dispatch-test.ts && tsx src/loader-test.ts && tsx src/mailbox-test.ts && tsx src/agent-routes-test.ts",
+    "test": "tsx src/send-test.ts && tsx src/dispatch-test.ts && tsx src/acp-dispatch-test.ts && tsx src/loader-test.ts && tsx src/mailbox-test.ts && tsx src/agent-routes-test.ts && tsx src/callback-url-test.ts",
     "test:e2e": "tsx scripts/e2e-mailbox.ts",
     "prepublishOnly": "npm run build && tsx scripts/generate-skill.ts"
   },

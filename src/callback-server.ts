@@ -378,6 +378,13 @@ export async function startCallbackServer(
 
   return new Promise<number>((resolve, reject) => {
     server!.on("error", (err: Error) => {
+      // A bind failure must not leave a non-listening server behind: the next
+      // start attempt would otherwise short-circuit on `if (server)` and the
+      // caller would believe the callback route is available.
+      if (!server?.listening) {
+        server = null;
+        _boundPort = 0;
+      }
       if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
         reject(new Error(`Port ${port} already in use`));
       } else {

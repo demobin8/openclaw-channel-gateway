@@ -325,7 +325,14 @@ export async function dispatchInbound(params: DispatchInboundParams): Promise<Re
     const ttlMs = ((liteGw.callbackTokenTTL as number) ?? 1800) * 1000;
     const callbackToken = registerDeliver(deliver, ttlMs);
     const callbackHost = (liteGw.callbackPublicHost as string) ?? (liteGw.callbackHost as string) ?? "0.0.0.0";
-    const callbackPort = (liteGw.callbackPublicPort as number) ?? (getCallbackPort() || (liteGw.callbackPort as number) || 3457);
+    // Advertised port first, then the configured callback port, then the actual bound
+    // port. The bound port may be the local listener (e.g. 3457) while the agent reaches
+    // us through a proxy on another port, so it must never override an explicit port.
+    const callbackPort =
+      (liteGw.callbackPublicPort as number) ||
+      (liteGw.callbackPort as number) ||
+      getCallbackPort() ||
+      3457;
     const callbackUrl = buildCallbackUrl(callbackHost, callbackPort, callbackToken);
 
     console.log(`[ocg] Async dispatch → agent, callback=${callbackUrl}`);

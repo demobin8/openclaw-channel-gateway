@@ -71,6 +71,40 @@ export async function stopAll(): Promise<void> {
 }
 
 /**
+ * Start the callback server when this process needs it.
+ *
+ * In async mode every reply travels back through the callback server, so a
+ * process that cannot bind it must not start channels: doing so would accept
+ * messages it can never answer (typically a second `channels start` process
+ * next to the gateway that already owns the port).
+ */
+export async function ensureCallbackServer(rawCfg: LiteGatewayConfig): Promise<void> {
+  if (isCallbackServerRunning()) return;
+
+  // The daemon also generates/reads the local token here so CLI commands can
+  // authenticate against the agent routes (techdesign §5.9).
+  try {
+    ensureLocalToken();
+  } catch (err) {
+    console.warn(`[ocg] Failed to prepare local token: ${(err as Error).message}`);
+  }
+
+  const cbHost = rawCfg.callbackHost ?? "0.0.0.0";
+  const cbPort = rawCfg.callbackPort ?? 3457;
+  try {
+    await startCallbackServer(cbHost, cbPort, rawCfg.callbackSecret);
+  } catch (err) {
+    const message = `[ocg] Failed to start callback server: ${(err as Error).message}`;
+    console.error(message);
+    if (rawCfg.async) {
+      throw new Error(
+        `${message}. Async mode needs the callback server; another OCG process is probably using port ${cbPort}.`,
+      );
+    }
+  }
+}
+
+/**
  * Start all enabled channels from config.
  * Each channel's plugin config adapter determines which accounts are enabled.
  */
@@ -83,23 +117,7 @@ export async function startAll(
 
   applyConfigEnvOverrides(rawCfg);
 
-  // Start callback server for async dispatch (only if not already running).
-  // The daemon also generates/reads the local token here so CLI commands can
-  // authenticate against the agent routes (techdesign §5.9).
-  if (!isCallbackServerRunning()) {
-    try {
-      ensureLocalToken();
-    } catch (err) {
-      console.warn(`[ocg] Failed to prepare local token: ${(err as Error).message}`);
-    }
-    const cbHost = rawCfg.callbackHost ?? "0.0.0.0";
-    const cbPort = rawCfg.callbackPort ?? 3457;
-    try {
-      await startCallbackServer(cbHost, cbPort, rawCfg.callbackSecret);
-    } catch (err) {
-      console.error(`[ocg] Failed to start callback server: ${(err as Error).message}`);
-    }
-  }
+  await ensureCallbackServer(rawCfg);
 
   const cfg = buildOpenClawConfig(rawCfg);
   const channelIds = Object.keys(rawCfg.channels ?? {});

@@ -192,6 +192,8 @@ export function buildOpenClawConfig(raw: LiteGatewayConfig): Record<string, unkn
       apiKey: raw.apiKey,
       verbose: raw.verbose,
       async: raw.async ?? false,
+      callbackPublicHost: raw.callbackPublicHost,
+      callbackPublicPort: raw.callbackPublicPort,
       callbackHost: raw.callbackPublicHost ?? raw.callbackHost,
       callbackPort: raw.callbackPublicPort ?? raw.callbackPort,
       callbackUrl: `http://${raw.callbackPublicHost ?? raw.callbackHost ?? "127.0.0.1"}:${raw.callbackPublicPort ?? raw.callbackPort ?? 3457}/ocg/callback`,
