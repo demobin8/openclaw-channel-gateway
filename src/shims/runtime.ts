@@ -30,12 +30,6 @@ import type { DeliverFn } from "../reply-chunking.js";
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
 
 import {
-  shouldComputeCommandAuthorized,
-  resolveCommandAuthorizedFromAuthorizers,
-  isControlCommandMessage,
-} from "openclaw/plugin-sdk/command-auth";
-
-import {
   resolveAgentRoute,
   buildAgentSessionKey,
 } from "openclaw/plugin-sdk/routing";
@@ -47,6 +41,71 @@ import {
 import {
   finalizeInboundContext,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
+
+import {
+  saveMediaBuffer as ocgSaveMediaBuffer,
+} from "openclaw/plugin-sdk/media-store";
+
+// ── command-auth helpers: resilient across OpenClaw releases ─────────────
+
+type SdkModule = Record<string, unknown>;
+type SdkFunction = (...args: unknown[]) => unknown;
+
+function isMissingModuleError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ERR_PACKAGE_PATH_NOT_EXPORTED" || code === "ERR_MODULE_NOT_FOUND";
+}
+
+async function importOptionalModule(specifier: string): Promise<SdkModule | undefined> {
+  try {
+    return (await import(specifier)) as SdkModule;
+  } catch (err) {
+    if (isMissingModuleError(err)) return undefined;
+    throw err;
+  }
+}
+
+/**
+ * OpenClaw moves helpers between plugin-sdk subpaths across releases:
+ * `command-auth` was split into `command-detection` / `command-auth-native`
+ * in 2026.10. Try every known location and fall back to a local stub, so a
+ * host upgrade degrades command handling instead of killing the whole
+ * runtime (the gateway does not handle control commands anyway).
+ */
+function resolveCommandAuthHelper(
+  modules: Array<SdkModule | undefined>,
+  name: string,
+  fallback: SdkFunction,
+): SdkFunction {
+  for (const mod of modules) {
+    const value = mod?.[name];
+    if (typeof value === "function") return value as SdkFunction;
+  }
+  console.warn(`[ocg] openclaw plugin-sdk does not export ${name}; using a local fallback`);
+  return fallback;
+}
+
+const commandAuthModules = await Promise.all([
+  importOptionalModule("openclaw/plugin-sdk/command-auth"),
+  importOptionalModule("openclaw/plugin-sdk/command-detection"),
+  importOptionalModule("openclaw/plugin-sdk/command-auth-native"),
+]);
+
+const shouldComputeCommandAuthorized = resolveCommandAuthHelper(
+  commandAuthModules,
+  "shouldComputeCommandAuthorized",
+  () => false,
+);
+const resolveCommandAuthorizedFromAuthorizers = resolveCommandAuthHelper(
+  commandAuthModules,
+  "resolveCommandAuthorizedFromAuthorizers",
+  () => false,
+);
+const isControlCommandMessage = resolveCommandAuthHelper(
+  commandAuthModules,
+  "isControlCommandMessage",
+  () => false,
+);
 
 // resolveHumanDelayConfig is in agent-runtime, not reply-runtime.
 // Provide a local implementation to avoid pulling in the full agent system.
@@ -63,10 +122,6 @@ function resolveHumanDelayConfig(
     maxMs: humanDelay.maxMs,
   };
 }
-
-import {
-  saveMediaBuffer as ocgSaveMediaBuffer,
-} from "openclaw/plugin-sdk/media-store";
 
 // ── Types ────────────────────────────────────────────────────────────────
 

@@ -392,6 +392,12 @@ export async function loadChannelPlugin(
           `[ocg] Could not inject runtime for ${candidate.id}:`,
           (err as Error).message,
         );
+        if ((err as NodeJS.ErrnoException).code === "ERR_PACKAGE_PATH_NOT_EXPORTED") {
+          console.warn(
+            `[ocg] openclaw ${openclawVersion()} no longer exposes a plugin-sdk module this ` +
+              `OCG build needs; install the openclaw version OCG depends on or upgrade OCG.`,
+          );
+        }
       }
     }
 

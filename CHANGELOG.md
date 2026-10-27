@@ -4,6 +4,39 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.3.3] — 2026-10-27
+
+### Fixed
+
+- **Pin the OpenClaw host and the bundled channel plugins.** `openclaw` was
+  declared as `^2026.6.0`, so a fresh `npm install -g` resolved 2026.10.x,
+  which no longer exports `openclaw/plugin-sdk/command-auth`. Runtime
+  injection then failed for every plugin that needs it
+  (`ERR_PACKAGE_PATH_NOT_EXPORTED`) and channel starts crashed the same way.
+  Dependencies are now exact: `openclaw@2026.6.6`,
+  `@openclaw/qqbot@2026.6.6`, `@tencent-weixin/openclaw-weixin@2.4.4`,
+  `@dingtalk-real-ai/dingtalk-connector@0.8.23`. Upgrade them together, as a
+  deliberate change — the shims track OpenClaw internals.
+- **Resolve the command-auth helpers across host releases.** The runtime shim
+  looks in `command-auth`, `command-detection` and `command-auth-native` and
+  falls back to a no-op when none of them exports a helper, so a newer host
+  degrades command handling instead of preventing the runtime from loading.
+  The loader warning now names the installed OpenClaw version.
+
+---
+
+## [1.3.2] — 2026-10-19
+
+### Fixed
+
+- **Advertise the configured public callback port.** Async replies used the
+  locally bound port instead of `callbackPublicPort`, so proxied deployments
+  sent callbacks to an unreachable address.
+- Async mode now fails fast when the callback server cannot bind, and a failed
+  bind no longer leaves a non-listening server behind.
+
+---
+
 ## [1.3.1] — 2026-10-16
 
 Review follow-ups for the 1.3.0 agent CLI (docs/techdesign-agent-cli.md §13).
