@@ -444,6 +444,14 @@ section("8. HTTP /ocg/send route");
   const okBody = await okRes.json() as Record<string, unknown>;
   check("signed request → 200", okRes.status === 200 && okBody.ok === true, { status: okRes.status, okBody });
 
+  const aliasRes = await fetchNoKeepAlive(`http://127.0.0.1:${port}/ocg/v1/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-OCG-Signature": sign(body, secret) },
+    body,
+  });
+  const aliasBody = await aliasRes.json() as Record<string, unknown>;
+  check("v1 alias signed request → 200", aliasRes.status === 200 && aliasBody.ok === true, { status: aliasRes.status, aliasBody });
+
   const badSig = await fetchNoKeepAlive(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-OCG-Signature": sign(body, "wrong-secret") },

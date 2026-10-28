@@ -110,6 +110,63 @@ export function extractInboundMessage(
 
 // ── Dispatch ──────────────────────────────────────────────────────────────
 
+export type InboundAccessDecision = { allowed: boolean; reason?: string };
+
+type ChannelAccessConfig = {
+  dmPolicy?: unknown;
+  allowFrom?: unknown;
+  groupPolicy?: unknown;
+  allowedGroups?: unknown;
+};
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "").map((entry) => entry.trim());
+}
+
+/**
+ * Channel-level ingress authorization. This is deliberately in OCG, not in a
+ * consumer: every transport (mailbox/http/acp) sees only accepted messages.
+ * `open` is the backward-compatible default; `allowlist` and `pairing` both
+ * require the sender (or group) to be listed. Pairing's approval flow is a
+ * later layer; until then an unlisted sender is dropped instead of admitted.
+ */
+export function isInboundAuthorized(
+  cfg: Record<string, unknown>,
+  channelId: string,
+  message: Pick<InboundMessage, "chatType" | "sender" | "target" | "sessionKey">,
+): InboundAccessDecision {
+  const channels = cfg.channels;
+  if (!channels || typeof channels !== "object") return { allowed: true };
+  const section = (channels as Record<string, unknown>)[channelId];
+  if (!section || typeof section !== "object") return { allowed: true };
+  const access = section as ChannelAccessConfig;
+
+  if (message.chatType === "group" || message.chatType === "channel") {
+    const policy = typeof access.groupPolicy === "string" ? access.groupPolicy : "open";
+    if (policy !== "allowlist") return { allowed: true };
+    const groups = stringList(access.allowedGroups);
+    if (groups.includes("*")) return { allowed: true };
+    const peer = (message.target ?? message.sessionKey).trim();
+    if (peer && groups.includes(peer)) return { allowed: true };
+    return { allowed: false, reason: `group "${peer || "unknown"}" is not in allowedGroups` };
+  }
+
+  const policy = typeof access.dmPolicy === "string" ? access.dmPolicy : "open";
+  if (policy === "open") return { allowed: true };
+  const allowFrom = stringList(access.allowFrom);
+  if (allowFrom.includes("*")) return { allowed: true };
+  const sender = (message.sender.id ?? message.target ?? "").trim();
+  if (!sender) return { allowed: false, reason: "sender id is unknown" };
+  if (allowFrom.includes(sender)) return { allowed: true };
+  return {
+    allowed: false,
+    reason: policy === "pairing"
+      ? `sender "${sender}" has not completed pairing`
+      : `sender "${sender}" is not in allowFrom`,
+  };
+}
+
 export type BeforeDeliverFn = (
   payload: Record<string, unknown>,
   meta: Record<string, unknown>,
@@ -151,6 +208,12 @@ export async function dispatchInbound(params: DispatchInboundParams): Promise<Re
   const agentUser = channelId && !sessionKey.startsWith(`${channelId}:`)
     ? `${channelId}:${sessionKey}`
     : sessionKey;
+  const inboundMessage = extractInboundMessage(ctx, { channelId });
+  const access = isInboundAuthorized(cfg, channelId ?? "unknown", inboundMessage);
+  if (!access.allowed) {
+    console.warn(`[ocg:inbound] dropped channel=${channelId ?? "unknown"} reason=${access.reason ?? "not authorized"}`);
+    return { queuedFinal: false, dropped: true, reason: access.reason };
+  }
 
   /** Rewrite local file paths in reply text so QQ Bot plugin can access them. */
   const maybeRewriteMedia = (text: string): string =>
@@ -219,13 +282,12 @@ export async function dispatchInbound(params: DispatchInboundParams): Promise<Re
       ...(cfg as LiteGatewayConfig),
       ...(disk ?? {}),
     });
-    const message = extractInboundMessage(ctx, { channelId });
     const handle = deliver
       ? { deliver, expiresAt: Date.now() + settings.replyTtlMs }
       : null;
 
     const mailbox = ensureMailbox({ settings });
-    const entry = mailbox.enqueue(message, handle);
+    const entry = mailbox.enqueue(inboundMessage, handle);
     console.log(
       `[ocg:mailbox] enqueued id=${entry.id} channel=${entry.channel} target=${entry.target ?? "(unknown)"} replyable=${entry.replyable}`,
     );

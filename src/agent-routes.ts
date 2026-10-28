@@ -7,7 +7,11 @@
  *   GET  /ocg/inbox/{id}
  *   POST /ocg/inbox/{id}/ack
  *   POST /ocg/inbox/{id}/reply
+ *   POST /ocg/inbox/{id}/release
  *   GET  /ocg/targets
+ *
+ * `/ocg/v1/*` is the frozen contract alias; the unversioned paths keep
+ * working for 1.3.x clients.
  *
  * Every route accepts either the local token (`X-OCG-Local-Token`, loopback
  * only when the server binds a wildcard host) or an HMAC signature
@@ -21,6 +25,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { URL } from "node:url";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   buildOpenClawConfig,
@@ -37,11 +42,21 @@ import { jsonBody, readBodyLimited } from "./http-util.js";
 import { deliverPayloadInChunks, resolveReplyChunkSize, rewriteLocalMediaPathsForDelivery } from "./reply-chunking.js";
 import { executeSend } from "./send-service.js";
 import {
+  channelLoginStart,
+  channelLoginWait,
   ensureChannelPluginLoaded,
   getChannelPlugin,
   listRunningAccounts,
   type ChannelPluginObject,
 } from "./plugin-loader.js";
+import {
+  restartChannel,
+  restartChannelAccount,
+  startChannel,
+  startChannelAccount,
+  stopChannel,
+  stopChannelAccount,
+} from "./gateway.js";
 
 // ── Route context (injection seam; tests supply fixtures) ─────────────────
 
@@ -294,10 +309,23 @@ function handleHealth(res: ServerResponse, ctx: AgentRouteContext): void {
 
   jsonBody(res, 200, {
     ok: true,
+    apiVersion: 1,
+    features: ["inbox", "release", "reply-idempotency", "channel-admin", "login"],
     version: ctx.version?.() ?? readPackageVersion(),
     pid: process.pid,
     uptimeMs: Math.max(0, (ctx.now?.() ?? Date.now()) - (ctx.startedAt ?? MODULE_STARTED_AT)),
     agentType: globalType,
+    session: {
+      dmScope: (() => {
+        try {
+          const raw = ctx.getRawConfig() as { session?: { dmScope?: unknown } } | null;
+          const scope = raw?.session?.dmScope;
+          return typeof scope === "string" && scope.trim() ? scope : "per-channel-peer";
+        } catch {
+          return "per-channel-peer";
+        }
+      })(),
+    },
     mailbox: {
       enabled: ctx.isMailboxEnabled(),
       pending: stats.pending,
@@ -442,6 +470,60 @@ function handleAck(
   });
 }
 
+function handleRelease(
+  res: ServerResponse,
+  url: URL,
+  id: string,
+  body: Record<string, unknown>,
+  mailbox: Mailbox,
+): void {
+  const consumer = resolveConsumer(body.consumer, url);
+  const entry = mailbox.get(id);
+  if (!entry) return respondError(res, 404, "NOT_FOUND", `unknown message id "${id}"`);
+  if (entry.state === "done") {
+    return jsonBody(res, 200, { ok: true, id, state: "done", released: 0, alreadyDone: true });
+  }
+  if (entry.state === "pending") {
+    return jsonBody(res, 200, { ok: true, id, state: "pending", released: 0, alreadyPending: true });
+  }
+  const released = mailbox.release([id], consumer);
+  if (released === 0) {
+    return respondError(res, 409, "LEASE_HELD_BY_OTHER", `message "${id}" is leased by consumer "${entry.consumer ?? "unknown"}"`, {
+      hint: "release is only allowed for the lease holder",
+    });
+  }
+  jsonBody(res, 200, { ok: true, id, state: "pending", released: 1 });
+}
+
+type ReplyReceipt = { clientReplyId: string; body: Record<string, unknown>; at: number };
+const replyReceipts = new Map<string, ReplyReceipt>();
+const REPLY_RECEIPT_TTL_MS = 30 * 60 * 1000;
+const MAX_REPLY_RECEIPTS = 1_000;
+
+function pruneReplyReceipts(now = Date.now()): void {
+  for (const [id, receipt] of replyReceipts) {
+    if (now - receipt.at > REPLY_RECEIPT_TTL_MS) replyReceipts.delete(id);
+  }
+  while (replyReceipts.size > MAX_REPLY_RECEIPTS) {
+    const oldest = replyReceipts.keys().next().value;
+    if (typeof oldest !== "string") break;
+    replyReceipts.delete(oldest);
+  }
+}
+
+function replyWithReceipt(
+  res: ServerResponse,
+  id: string,
+  clientReplyId: string | undefined,
+  body: Record<string, unknown>,
+): void {
+  if (clientReplyId) {
+    replyReceipts.set(id, { clientReplyId, body, at: Date.now() });
+    pruneReplyReceipts();
+  }
+  jsonBody(res, 200, body);
+}
+
 async function handleReply(
   res: ServerResponse,
   url: URL,
@@ -452,6 +534,16 @@ async function handleReply(
 ): Promise<void> {
   const entry = mailbox.get(id);
   if (!entry) return respondError(res, 404, "NOT_FOUND", `unknown message id "${id}"`);
+
+  const clientReplyId = typeof body.clientReplyId === "string" && body.clientReplyId.trim() !== ""
+    ? body.clientReplyId.trim()
+    : undefined;
+  if (clientReplyId) {
+    const receipt = replyReceipts.get(id);
+    if (receipt && receipt.clientReplyId === clientReplyId) {
+      return jsonBody(res, 200, { ...receipt.body, idempotent: true });
+    }
+  }
 
   if (entry.state === "done" && entry.doneBy === "reply") {
     return respondError(res, 409, "ALREADY_REPLIED", `message "${id}" was already replied to`, {
@@ -526,7 +618,7 @@ async function handleReply(
         );
         const updated = mailbox.markReplied(id);
         console.log(`[ocg:mailbox] replied id=${id} via=reply chunks=${chunks}`);
-        jsonBody(res, 200, {
+        replyWithReceipt(res, id, clientReplyId, {
           ok: true,
           id,
           via: "reply",
@@ -619,7 +711,7 @@ async function handleReply(
 
     mailbox.markReplied(id);
     console.log(`[ocg:mailbox] replied id=${id} via=send`);
-    jsonBody(res, 200, {
+    replyWithReceipt(res, id, clientReplyId, {
       ok: true,
       id,
       via: "send",
@@ -645,21 +737,217 @@ function handleTargets(res: ServerResponse, url: URL, mailbox: Mailbox): void {
   jsonBody(res, 200, { ok: true, targets });
 }
 
+// ── Channel administration ────────────────────────────────────────────────
+
+type LoginStatus = "pending" | "confirmed" | "expired" | "failed" | "cancelled";
+type LoginSession = {
+  loginId: string;
+  channelId: string;
+  accountId: string;
+  sessionKey: string;
+  qrDataUrl: string;
+  status: LoginStatus;
+  message?: string;
+  startedAt: number;
+  expiresAt: number;
+};
+const loginSessions = new Map<string, LoginSession>();
+const LOGIN_TTL_MS = 10 * 60 * 1000;
+
+function handleChannelsList(res: ServerResponse, ctx: AgentRouteContext): void {
+  const raw = ctx.getRawConfig() ?? {};
+  const running = new Set(listRunningAccounts().map((entry) => `${entry.channelId}:${entry.accountId}`));
+  const channels = Object.entries(raw.channels ?? {}).map(([channelId, section]) => {
+    let accountIds = ["default"];
+    try {
+      const plugin = ctx.getPlugin?.(channelId);
+      const ids = plugin?.config?.listAccountIds?.(ctx.getConfig());
+      if (Array.isArray(ids) && ids.length > 0) accountIds = ids;
+    } catch { /* fall back to the default account */ }
+    const enabled = !(section && typeof section === "object" && (section as { enabled?: unknown }).enabled === false);
+    return {
+      channelId,
+      enabled,
+      agentType: resolveChannelAgentType(channelId, ctx.getConfig()),
+      accounts: accountIds.map((accountId) => ({
+        accountId,
+        running: running.has(`${channelId}:${accountId}`),
+      })),
+    };
+  });
+  jsonBody(res, 200, { ok: true, channels });
+}
+
+async function handleChannelOp(
+  res: ServerResponse,
+  channelId: string,
+  op: string,
+  body: Record<string, unknown>,
+  ctx: AgentRouteContext,
+): Promise<void> {
+  try {
+    await ensureChannelPluginLoaded(channelId);
+    const cfg = ctx.getConfig();
+    const accountId = typeof body.accountId === "string" && body.accountId.trim()
+      ? body.accountId.trim()
+      : undefined;
+    if (accountId) {
+      if (op === "start") {
+        const started = await startChannelAccount(channelId, cfg, accountId);
+        jsonBody(res, 200, { ok: true, channelId, accountId, started });
+        return;
+      }
+      if (op === "stop") {
+        const stopped = await stopChannelAccount(channelId, accountId);
+        jsonBody(res, 200, { ok: true, channelId, accountId, stopped });
+        return;
+      }
+      const restarted = await restartChannelAccount(channelId, cfg, accountId);
+      jsonBody(res, 200, { ok: true, channelId, accountId, restarted });
+      return;
+    }
+    if (op === "start") {
+      const started = await startChannel(channelId, cfg);
+      jsonBody(res, 200, { ok: true, channelId, started });
+      return;
+    }
+    if (op === "stop") {
+      await stopChannel(channelId);
+      jsonBody(res, 200, { ok: true, channelId, stopped: true });
+      return;
+    }
+    const restarted = await restartChannel(channelId, cfg);
+    jsonBody(res, 200, { ok: true, channelId, restarted });
+  } catch (error) {
+    respondError(res, 500, "CHANNEL_OP_FAILED", error instanceof Error ? error.message : String(error), { channelId, op });
+  }
+}
+
+async function handleLoginStart(
+  res: ServerResponse,
+  channelId: string,
+  body: Record<string, unknown>,
+  ctx: AgentRouteContext,
+): Promise<void> {
+  const accountId = typeof body.accountId === "string" && body.accountId.trim() ? body.accountId.trim() : "default";
+  try {
+    const cfg = ctx.getConfig();
+    const started = await channelLoginStart(channelId, {
+      cfg,
+      accountId,
+      force: body.force === true,
+      verbose: false,
+    }) as { qrDataUrl?: unknown; sessionKey?: unknown; message?: unknown };
+    const qrDataUrl = typeof started.qrDataUrl === "string" ? started.qrDataUrl : "";
+    const sessionKey = typeof started.sessionKey === "string" ? started.sessionKey : accountId;
+    const loginId = `login_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const session: LoginSession = {
+      loginId,
+      channelId,
+      accountId,
+      sessionKey,
+      qrDataUrl,
+      status: "pending",
+      message: typeof started.message === "string" ? started.message : undefined,
+      startedAt: Date.now(),
+      expiresAt: Date.now() + LOGIN_TTL_MS,
+    };
+    loginSessions.set(loginId, session);
+    void channelLoginWait(channelId, {
+      cfg,
+      sessionKey,
+      accountId,
+      timeoutMs: LOGIN_TTL_MS,
+    }).then(async (result) => {
+      const current = loginSessions.get(loginId);
+      if (!current || current.status === "cancelled") return;
+      const value = result as { connected?: unknown; accountId?: unknown; message?: unknown };
+      current.status = value.connected === true ? "confirmed" : "expired";
+      current.message = typeof value.message === "string" ? value.message : undefined;
+      if (typeof value.accountId === "string" && value.accountId) current.accountId = value.accountId;
+      if (value.connected === true) {
+        try {
+          await restartChannelAccount(channelId, ctx.getConfig(), current.accountId);
+        } catch (error) {
+          current.message = `login succeeded but account restart failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+    }).catch((error) => {
+      const current = loginSessions.get(loginId);
+      if (!current || current.status === "cancelled") return;
+      current.status = "failed";
+      current.message = error instanceof Error ? error.message : String(error);
+    });
+    jsonBody(res, 200, {
+      ok: true,
+      loginId,
+      qrDataUrl,
+      qrVersion: 1,
+      expiresAt: session.expiresAt,
+    });
+  } catch (error) {
+    respondError(res, 500, "LOGIN_START_FAILED", error instanceof Error ? error.message : String(error), { channelId });
+  }
+}
+
+function handleLoginStatus(res: ServerResponse, loginId: string): void {
+  const session = loginSessions.get(loginId);
+  if (!session) return respondError(res, 404, "NOT_FOUND", `unknown login session "${loginId}"`);
+  if (session.status === "pending" && Date.now() > session.expiresAt) session.status = "expired";
+  jsonBody(res, 200, {
+    ok: true,
+    loginId: session.loginId,
+    channelId: session.channelId,
+    accountId: session.accountId,
+    status: session.status,
+    qrDataUrl: session.qrDataUrl,
+    qrVersion: 1,
+    expiresAt: session.expiresAt,
+    ...(session.message ? { message: session.message } : {}),
+  });
+}
+
+function handleLoginCancel(res: ServerResponse, loginId: string): void {
+  const session = loginSessions.get(loginId);
+  if (!session) return respondError(res, 404, "NOT_FOUND", `unknown login session "${loginId}"`);
+  if (session.status === "pending") {
+    session.status = "cancelled";
+    session.message = "cancelled by the caller";
+  }
+  jsonBody(res, 200, { ok: true, loginId, status: session.status });
+}
+
 // ── Route table ───────────────────────────────────────────────────────────
 
 const inboxItemPattern = /^\/ocg\/inbox\/([A-Za-z0-9_-]+)$/;
 const inboxAckPattern = /^\/ocg\/inbox\/([A-Za-z0-9_-]+)\/ack$/;
 const inboxReplyPattern = /^\/ocg\/inbox\/([A-Za-z0-9_-]+)\/reply$/;
+const inboxReleasePattern = /^\/ocg\/inbox\/([A-Za-z0-9_-]+)\/release$/;
+const channelsPattern = /^\/ocg\/channels$/;
+const channelOpPattern = /^\/ocg\/channels\/([A-Za-z0-9_-]+)\/(start|stop|restart)$/;
+const loginStartPattern = /^\/ocg\/channels\/([A-Za-z0-9_-]+)\/login$/;
+const loginStatusPattern = /^\/ocg\/channels\/([A-Za-z0-9_-]+)\/login\/([A-Za-z0-9_-]+)$/;
+
+/** `/ocg/v1/x` and `/ocg/x` share one handler table. */
+function normalizeAgentPath(pathname: string): string {
+  return pathname.replace(/^\/ocg\/v1(?=\/)/, "/ocg");
+}
 
 export function isAgentRoutePath(pathname: string): boolean {
+  const path = normalizeAgentPath(pathname);
   return (
-    pathname === "/ocg/health" ||
-    pathname === "/ocg/inbox" ||
-    pathname === "/ocg/inbox/wait" ||
-    pathname === "/ocg/targets" ||
-    inboxItemPattern.test(pathname) ||
-    inboxAckPattern.test(pathname) ||
-    inboxReplyPattern.test(pathname)
+    path === "/ocg/health" ||
+    path === "/ocg/inbox" ||
+    path === "/ocg/inbox/wait" ||
+    path === "/ocg/targets" ||
+    channelsPattern.test(path) ||
+    channelOpPattern.test(path) ||
+    loginStartPattern.test(path) ||
+    loginStatusPattern.test(path) ||
+    inboxItemPattern.test(path) ||
+    inboxAckPattern.test(path) ||
+    inboxReplyPattern.test(path) ||
+    inboxReleasePattern.test(path)
   );
 }
 
@@ -674,7 +962,7 @@ export async function handleAgentRoutes(
   ctx: AgentRouteContext,
   auth: RouteAuthOptions,
 ): Promise<boolean> {
-  const pathname = url.pathname;
+  const pathname = normalizeAgentPath(url.pathname);
   const method = req.method ?? "GET";
   if (!isAgentRoutePath(pathname)) return false;
 
@@ -684,11 +972,18 @@ export async function handleAgentRoutes(
       pathname === "/ocg/inbox" ||
       pathname === "/ocg/inbox/wait" ||
       pathname === "/ocg/targets" ||
+      channelsPattern.test(pathname) ||
+      loginStatusPattern.test(pathname) ||
       inboxItemPattern.test(pathname));
   const expectsPost =
     method === "POST" &&
-    (inboxAckPattern.test(pathname) || inboxReplyPattern.test(pathname));
-  if (!expectsGet && !expectsPost) {
+    (inboxAckPattern.test(pathname) ||
+      inboxReplyPattern.test(pathname) ||
+      inboxReleasePattern.test(pathname) ||
+      channelOpPattern.test(pathname) ||
+      loginStartPattern.test(pathname));
+  const expectsDelete = method === "DELETE" && loginStatusPattern.test(pathname);
+  if (!expectsGet && !expectsPost && !expectsDelete) {
     respondError(res, 405, "METHOD_NOT_ALLOWED", `${method} is not supported for ${pathname}`);
     return true;
   }
@@ -736,6 +1031,10 @@ export async function handleAgentRoutes(
   const itemMatch = inboxItemPattern.exec(pathname);
   const ackMatch = inboxAckPattern.exec(pathname);
   const replyMatch = inboxReplyPattern.exec(pathname);
+  const releaseMatch = inboxReleasePattern.exec(pathname);
+  const channelOpMatch = channelOpPattern.exec(pathname);
+  const loginStartMatch = loginStartPattern.exec(pathname);
+  const loginStatusMatch = loginStatusPattern.exec(pathname);
 
   if (pathname === "/ocg/health") {
     handleHealth(res, ctx);
@@ -759,6 +1058,27 @@ export async function handleAgentRoutes(
   }
   if (replyMatch) {
     await handleReply(res, url, replyMatch[1], body, ctx, mailbox);
+    return true;
+  }
+  if (releaseMatch) {
+    handleRelease(res, url, releaseMatch[1], body, mailbox);
+    return true;
+  }
+  if (channelsPattern.test(pathname)) {
+    handleChannelsList(res, ctx);
+    return true;
+  }
+  if (channelOpMatch) {
+    await handleChannelOp(res, channelOpMatch[1], channelOpMatch[2], body, ctx);
+    return true;
+  }
+  if (loginStartMatch) {
+    await handleLoginStart(res, loginStartMatch[1], body, ctx);
+    return true;
+  }
+  if (loginStatusMatch) {
+    if (method === "DELETE") handleLoginCancel(res, loginStatusMatch[2]);
+    else handleLoginStatus(res, loginStatusMatch[2]);
     return true;
   }
   if (pathname === "/ocg/targets") {

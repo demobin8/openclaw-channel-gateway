@@ -8,6 +8,7 @@ import {
   loadAllPlugins,
   startChannel as loadStartChannel,
   stopChannel as loadStopChannel,
+  stopChannelAccount as loadStopChannelAccount,
   stopAllChannels,
   listRunningChannels as loadListRunning,
   isChannelRunning,
@@ -35,6 +36,27 @@ export async function startChannel(
 
 export async function stopChannel(channelId: string): Promise<void> {
   await loadStopChannel(channelId);
+}
+
+export async function startChannelAccount(
+  channelId: string,
+  cfg: Record<string, unknown>,
+  accountId: string,
+): Promise<string[]> {
+  return await loadStartChannel(channelId, cfg, accountId);
+}
+
+export async function stopChannelAccount(channelId: string, accountId: string): Promise<boolean> {
+  return await loadStopChannelAccount(channelId, accountId);
+}
+
+export async function restartChannelAccount(
+  channelId: string,
+  cfg: Record<string, unknown>,
+  accountId: string,
+): Promise<string[]> {
+  await stopChannelAccount(channelId, accountId);
+  return await startChannelAccount(channelId, cfg, accountId);
 }
 
 export async function restartChannel(

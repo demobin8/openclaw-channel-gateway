@@ -533,6 +533,7 @@ const runningChannels = new Map<string, RunningState>();
 export async function startChannel(
   channelId: string,
   cfg: Record<string, unknown>,
+  onlyAccountId?: string,
 ): Promise<string[]> {
   const plugin = loadedPlugins.get(channelId);
   if (!plugin) throw new Error(`Plugin "${channelId}" not loaded`);
@@ -548,11 +549,16 @@ export async function startChannel(
     ? configAdapter.listAccountIds(cfg)
     : ["default"];
 
+  if (onlyAccountId && !accountIds.includes(onlyAccountId)) {
+    throw new Error(`UNKNOWN_ACCOUNT: ${channelId}:${onlyAccountId}`);
+  }
+
   console.log(`[ocg] ${channelId} accountIds from adapter:`, JSON.stringify(accountIds));
 
   const started: string[] = [];
 
   for (const accountId of accountIds) {
+    if (onlyAccountId && accountId !== onlyAccountId) continue;
     const runKey = `${channelId}:${accountId}`;
     if (runningChannels.has(runKey)) {
       console.log(`[ocg] ${runKey} already running, skipping`);
@@ -691,6 +697,15 @@ export async function stopChannel(channelId: string): Promise<void> {
       await entry.stop();
     }
   }
+}
+
+/** Stop one account; returns false when that account is not running. */
+export async function stopChannelAccount(channelId: string, accountId: string): Promise<boolean> {
+  const key = `${channelId}:${accountId}`;
+  const entry = runningChannels.get(key);
+  if (!entry) return false;
+  await entry.stop();
+  return true;
 }
 
 export function isChannelRunning(channelId: string): boolean {

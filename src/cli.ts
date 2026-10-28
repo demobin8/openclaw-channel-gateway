@@ -1808,6 +1808,7 @@ async function cmdReply(command: string, args: Args): Promise<void> {
   if (mediaUrl) body.mediaUrl = mediaUrl;
   if (isError) body.isError = true;
   if (typeof args.consumer === "string") body.consumer = args.consumer;
+  if (typeof args["client-reply-id"] === "string") body.clientReplyId = args["client-reply-id"];
   if (args.force === true) body.force = true;
 
   const response = await daemonCall(args, "POST", `/ocg/inbox/${encodeURIComponent(id)}/reply`, {

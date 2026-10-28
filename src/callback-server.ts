@@ -298,8 +298,8 @@ export async function startCallbackServer(
     }
     const pathname = requestUrl.pathname;
 
-    // Route: POST /ocg/send (proactive send)
-    if (req.method === "POST" && pathname === "/ocg/send") {
+    // Route: POST /ocg/send (proactive send); /ocg/v1/send is the frozen alias
+    if (req.method === "POST" && (pathname === "/ocg/send" || pathname === "/ocg/v1/send")) {
       await handleSendRequest(req, res, sendCtx, {
         localToken: authOptions.localToken,
         localTokenLoopbackOnly: authOptions.localTokenLoopbackOnly,
