@@ -4,6 +4,19 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.3.6] — 2026-11-13
+
+### Fixed
+
+- **Dispatch media-only inbound messages to the mailbox.** `dispatchReplyFromConfig`
+  returned early whenever the message body was empty, so a WeChat image without a
+  caption was downloaded and stored under the media directory but never enqueued
+  for consumers. The shim now checks for inbound media (`MediaPath` /
+  `MediaPaths` / `MediaUrl` / `MediaUrls`) before the early return and continues
+  to `dispatchInbound` when a file is present.
+
+---
+
 ## [1.3.5] — 2026-11-13
 
 ### Fixed
