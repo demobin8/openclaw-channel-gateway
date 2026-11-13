@@ -4,6 +4,22 @@ All notable changes to OpenClaw Channel Gateway will be documented in this file.
 
 ---
 
+## [1.3.5] — 2026-11-13
+
+### Fixed
+
+- **Restore the plugin media contract for WeChat inbound files.** The runtime
+  shim's `saveMediaBuffer` only accepted an options object, while
+  `openclaw-weixin` calls it positionally (`buffer, contentType, subdir,
+  maxBytes, originalFilename`). With `undefined` options the shim crashed on
+  `opts.dir`, the plugin swallowed the error, and inbound images, voice and
+  files were silently dropped (`media: []`). The shim now accepts both calling
+  conventions, writes under `<config dir>/media/<subdir>/`, derives the
+  extension from content type, original filename or magic bytes, enforces
+  `maxBytes`, and returns `{ id, path, size, contentType }`.
+
+---
+
 ## [1.3.3] — 2026-10-27
 
 ### Fixed
