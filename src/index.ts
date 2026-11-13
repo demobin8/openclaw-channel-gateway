@@ -8,7 +8,9 @@
  * Any bundled or external OpenClaw IM plugin works out of the box.
  */
 
-import { loadConfig, resolveConfigPath, resolveConfigDir, buildOpenClawConfig, applyConfigEnvOverrides, asAgentType, type LiteGatewayConfig } from "./config.js";
+import { mkdirSync } from "node:fs";
+
+import { loadConfig, resolveConfigPath, resolveConfigDir, resolveMediaDir, buildOpenClawConfig, applyConfigEnvOverrides, asAgentType, type LiteGatewayConfig } from "./config.js";
 import { startAll, stopAll, listRunningChannels } from "./gateway.js";
 import { stopCallbackServer, getCallbackPort } from "./callback-server.js";
 import { resetMailbox } from "./mailbox.js";
@@ -23,6 +25,7 @@ export {
   loadConfig,
   resolveConfigPath,
   resolveConfigDir,
+  resolveMediaDir,
   saveConfig,
   addChannel,
   removeChannel,
@@ -51,6 +54,17 @@ export async function startGateway(): Promise<void> {
   if (!cfg) throw new Error("No config found. Create ocg.json");
 
   applyConfigEnvOverrides(cfg);
+
+  // Inbound media (WeChat images/voice/files, …) is written under the OCG
+  // data dir. Make the location explicit in the daemon log so operators can
+  // find attachments without guessing.
+  const mediaDir = resolveMediaDir();
+  try {
+    mkdirSync(mediaDir, { recursive: true });
+  } catch (err) {
+    console.warn(`[ocg] Could not create media dir ${mediaDir}: ${(err as Error).message}`);
+  }
+  console.log(`[ocg] inbound media dir: ${mediaDir}`);
 
   const channelIds = Object.keys(cfg.channels ?? {});
   if (channelIds.length === 0) throw new Error("No channels configured");

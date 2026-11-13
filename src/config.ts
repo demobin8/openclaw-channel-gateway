@@ -156,6 +156,17 @@ export function resolveConfigPath(): string {
   return join(resolveConfigDir(), DEFAULT_CONFIG_FILE);
 }
 
+/**
+ * Resolve the inbound media store root: `<config dir>/media`.
+ *
+ * Follows `OCG_CONFIG_PATH` like the mailbox directory, so tests and
+ * side-by-side installs keep their media next to their own config instead of
+ * sharing `~/.openclaw-channel-gateway/media`.
+ */
+export function resolveMediaDir(): string {
+  return join(dirname(resolveConfigPath()), "media");
+}
+
 export function loadConfig(): LiteGatewayConfig | null {
   const configPath = resolveConfigPath();
   if (!existsSync(configPath)) return null;

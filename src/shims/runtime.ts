@@ -22,9 +22,11 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { dispatchInbound } from "../inbound.js";
+import { resolveMediaDir } from "../config.js";
 import type { DeliverFn } from "../reply-chunking.js";
 
 // ── Imports from real OpenClaw plugin-sdk (loader bypasses interception for shim callers) ──
@@ -41,10 +43,6 @@ import {
 import {
   finalizeInboundContext,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
-
-import {
-  saveMediaBuffer as ocgSaveMediaBuffer,
-} from "openclaw/plugin-sdk/media-store";
 
 // ── command-auth helpers: resilient across OpenClaw releases ─────────────
 
@@ -425,21 +423,215 @@ function resolveStorePath(
   }
 }
 
-// ── saveMediaBuffer (fallback) ───────────────────────────────────────────
+// ── saveMediaBuffer ──────────────────────────────────────────────────────
+//
+// Channel plugins call this the way OpenClaw's media store does — positionally:
+//
+//   saveMediaBuffer(buffer, contentType?, subdir?, maxBytes?, originalFilename?)
+//
+// and read `{ path }` back (`openclaw-weixin` stores `saved.path` as
+// `ctx.MediaPath`). The previous shim implemented only the object form and
+// returned a bare string, so the WeChat plugin's `saveMedia(buf, undefined,
+// "inbound", …)` call threw `Cannot read properties of undefined (reading
+// 'dir')` and inbound images were silently dropped.
+//
+// Both call shapes are supported now, and files go to the OCG data dir instead
+// of the OS temp dir so they survive restarts:
+//
+//   <config dir>/media/<subdir>/<timestamp>-<random>.<ext>
+//
+// The object form's `dir` is an explicit override kept for older callers.
 
-async function saveMediaBuffer(buffer: Buffer, opts: Record<string, unknown>): Promise<string> {
-  try {
-    const key = (opts.key as string) || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    return (await ocgSaveMediaBuffer(buffer, key as string)) as unknown as string;
-  } catch {
-    const dir = (opts.dir as string) || path.resolve(os.tmpdir(), "ocg-media");
-    const fs = await import("node:fs/promises");
-    await fs.mkdir(dir, { recursive: true });
-    const fname = `${Date.now()}-${Math.random().toString(36).slice(2)}.bin`;
-    const fpath = path.resolve(dir, fname);
-    await fs.writeFile(fpath, buffer);
-    return fpath;
+export type SavedMedia = {
+  id: string;
+  path: string;
+  size: number;
+  contentType?: string;
+};
+
+/** Options accepted by the legacy object-form call. */
+export type SaveMediaOptions = {
+  /** File-name hint; sanitized and used as the file stem. */
+  key?: string;
+  /** Explicit target directory (overrides `<media root>/<subdir>`). */
+  dir?: string;
+  contentType?: string;
+  subdir?: string;
+  maxBytes?: number;
+  originalFilename?: string;
+};
+
+/** Default cap, mirroring OpenClaw's media store (explicit `maxBytes` wins). */
+const DEFAULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
+
+const MIME_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/png": ".png",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/bmp": ".bmp",
+  "image/heic": ".heic",
+  "image/svg+xml": ".svg",
+  "audio/wav": ".wav",
+  "audio/x-wav": ".wav",
+  "audio/wave": ".wav",
+  "audio/silk": ".silk",
+  "audio/mpeg": ".mp3",
+  "audio/ogg": ".ogg",
+  "audio/amr": ".amr",
+  "audio/aac": ".aac",
+  "audio/mp4": ".m4a",
+  "video/mp4": ".mp4",
+  "video/quicktime": ".mov",
+  "video/webm": ".webm",
+  "application/pdf": ".pdf",
+  "application/json": ".json",
+  "application/zip": ".zip",
+  "text/plain": ".txt",
+};
+
+function normalizeMime(value: string | undefined): string | undefined {
+  const mime = value?.split(";")[0]?.trim().toLowerCase();
+  return mime || undefined;
+}
+
+function extensionFromFilename(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const ext = path.extname(name).toLowerCase();
+  return /^\.[a-z0-9]{1,10}$/u.test(ext) ? ext : undefined;
+}
+
+/**
+ * Last-resort extension detection from magic bytes. WeChat images arrive with
+ * no content type and no filename, so without this the very case being fixed
+ * would land as `.bin` even though the bytes are a valid JPEG/PNG.
+ */
+function sniffMediaExtension(buffer: Buffer): string | undefined {
+  const hasBytes = (...bytes: number[]) => bytes.every((byte, index) => buffer[index] === byte);
+  const ascii = (start: number, end: number) =>
+    buffer.length >= end ? buffer.toString("ascii", start, end) : "";
+
+  if (hasBytes(0xff, 0xd8, 0xff)) return ".jpg";
+  if (hasBytes(0x89, 0x50, 0x4e, 0x47)) return ".png";
+  if (hasBytes(0x47, 0x49, 0x46, 0x38)) return ".gif";
+  if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return ".webp";
+  if (hasBytes(0x42, 0x4d)) return ".bmp";
+  if (ascii(0, 4) === "%PDF") return ".pdf";
+  if (hasBytes(0x50, 0x4b, 0x03, 0x04)) return ".zip";
+  if (ascii(4, 8) === "ftyp") return ".mp4";
+  return undefined;
+}
+
+/** contentType → original filename / key → magic bytes → `.bin`. */
+function resolveMediaExtension(
+  contentType: string | undefined,
+  originalFilename: string | undefined,
+  key: string | undefined,
+  buffer: Buffer,
+): string {
+  const mime = normalizeMime(contentType);
+  if (mime && MIME_EXTENSIONS[mime]) return MIME_EXTENSIONS[mime];
+  return extensionFromFilename(originalFilename) ??
+    extensionFromFilename(key) ??
+    sniffMediaExtension(buffer) ??
+    ".bin";
+}
+
+/** Reject absolute paths and `..` segments so a caller cannot escape the media root. */
+function resolveMediaSubdir(subdir: unknown): string {
+  if (subdir === undefined || subdir === null) return "";
+  if (typeof subdir !== "string") {
+    throw new Error(`saveMediaBuffer: unsafe media subdir: ${JSON.stringify(subdir)}`);
   }
+  const raw = subdir.trim();
+  if (raw === "" || raw === ".") return "";
+  if (raw.includes("\0") || path.isAbsolute(raw) || path.win32.isAbsolute(raw) || /^[a-zA-Z]:/u.test(raw)) {
+    throw new Error(`saveMediaBuffer: unsafe media subdir: ${JSON.stringify(subdir)}`);
+  }
+  const segments = raw.split(/[\\/]+/u);
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`saveMediaBuffer: unsafe media subdir: ${JSON.stringify(subdir)}`);
+  }
+  return path.join(...segments);
+}
+
+function resolveMediaTargetDir(opts: SaveMediaOptions): string {
+  if (typeof opts.dir === "string" && opts.dir.trim() !== "") {
+    return path.resolve(opts.dir);
+  }
+  const root = resolveMediaDir();
+  const relative = resolveMediaSubdir(opts.subdir ?? "inbound");
+  const dir = relative ? path.join(root, relative) : root;
+  const insideRoot = path.relative(root, dir);
+  if (insideRoot.startsWith("..") || path.isAbsolute(insideRoot)) {
+    throw new Error(`saveMediaBuffer: media subdir escapes media root: ${JSON.stringify(opts.subdir)}`);
+  }
+  return dir;
+}
+
+function resolveMaxBytes(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : DEFAULT_MEDIA_MAX_BYTES;
+}
+
+/** Keep only a short, filesystem-safe stem from a caller-provided key/filename. */
+function safeFileStem(value: string): string | undefined {
+  const base = path.basename(value).replace(/\.[^.]*$/u, "");
+  const stem = base.replace(/[^\p{L}\p{N}._-]+/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 60);
+  return stem || undefined;
+}
+
+export function saveMediaBuffer(
+  buffer: Buffer,
+  contentType?: string,
+  subdir?: string,
+  maxBytes?: number,
+  originalFilename?: string,
+): Promise<SavedMedia>;
+export function saveMediaBuffer(buffer: Buffer, options?: SaveMediaOptions): Promise<SavedMedia>;
+export async function saveMediaBuffer(
+  buffer: Buffer,
+  contentTypeOrOptions?: string | SaveMediaOptions,
+  subdir?: string,
+  maxBytes?: number,
+  originalFilename?: string,
+): Promise<SavedMedia> {
+  if (!Buffer.isBuffer(buffer)) {
+    throw new TypeError("saveMediaBuffer: buffer must be a Buffer");
+  }
+
+  const opts: SaveMediaOptions =
+    typeof contentTypeOrOptions === "string" || contentTypeOrOptions === undefined
+      ? { contentType: contentTypeOrOptions, subdir, maxBytes, originalFilename }
+      : contentTypeOrOptions;
+
+  const limit = resolveMaxBytes(opts.maxBytes);
+  if (buffer.byteLength > limit) {
+    // Checked before mkdir/writeFile: an oversized buffer must not touch disk.
+    throw new Error(
+      `Media exceeds ${(limit / (1024 * 1024)).toFixed(0)}MB limit ` +
+        `(${buffer.byteLength} bytes > ${limit} bytes)`,
+    );
+  }
+
+  const dir = resolveMediaTargetDir(opts);
+  await mkdir(dir, { recursive: true });
+
+  const ext = resolveMediaExtension(opts.contentType, opts.originalFilename, opts.key, buffer);
+  const stem = opts.key ? safeFileStem(opts.key) : undefined;
+  const random = randomUUID().replace(/-/gu, "").slice(0, 12);
+  const id = `${stem ? `${stem}-` : ""}${Date.now()}-${random}${ext}`;
+  const filePath = path.resolve(dir, id);
+  await writeFile(filePath, buffer);
+
+  return {
+    id,
+    path: filePath,
+    size: buffer.byteLength,
+    contentType: normalizeMime(opts.contentType),
+  };
 }
 
 // ── recordInboundSession (stub) ──────────────────────────────────────────
