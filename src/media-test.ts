@@ -20,8 +20,9 @@ import { dirname, join } from "node:path";
 const dataDir = mkdtempSync(join(tmpdir(), "ocg-media-test-"));
 process.env.OCG_CONFIG_PATH = join(dataDir, "ocg.json");
 
-const { saveMediaBuffer } = await import("./shims/runtime.js");
+const { saveMediaBuffer, createPluginRuntime } = await import("./shims/runtime.js");
 const { resolveMediaDir } = await import("./config.js");
+const { ensureMailbox, resetMailbox } = await import("./mailbox.js");
 
 let failures = 0;
 
@@ -155,6 +156,67 @@ const absoluteError = await expectError(() =>
   saveMediaBuffer(PNG_BYTES, "image/png", join(dataDir, "absolute")),
 );
 check("rejects absolute subdir", absoluteError !== null, absoluteError?.message);
+
+// ── Media-only dispatch reaches the mailbox ────────────────────────────────
+section("media-only dispatch enqueues into the mailbox");
+
+const runtime = createPluginRuntime(undefined, "test", "openclaw-weixin");
+const reply = (runtime.channel as Record<string, Record<string, unknown>>).reply;
+const dispatch = reply.dispatchReplyFromConfig as (params: {
+  ctx: Record<string, unknown>;
+  cfg: Record<string, unknown>;
+  dispatcher: Record<string, unknown>;
+}) => Promise<{ queuedFinal: boolean; counts: Record<string, number> }>;
+
+const dispatcher = {
+  sendToolResult: () => true,
+  sendBlockReply: () => true,
+  sendFinalReply: () => true,
+  markComplete: () => {},
+  waitForIdle: async () => {},
+  getQueuedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+  getFailedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+  getCancelledCounts: () => ({ tool: 0, block: 0, final: 0 }),
+};
+
+const baseCtx = {
+  From: "openclaw-weixin:direct:test-user",
+  To: "test-user",
+  AccountId: "test-account",
+  ChatType: "direct",
+  SessionKey: "agent:main:openclaw-weixin:test-account:direct:test-user",
+};
+
+// WeChat images arrive with an empty Body and only MediaPath/MediaType set.
+const mediaOnly = await dispatch({
+  ctx: { ...baseCtx, MediaPath: weixinStyle.path, MediaType: "image/*" },
+  cfg: { liteGateway: { agentType: "mailbox" } },
+  dispatcher,
+});
+check("returns without a queued final", mediaOnly.queuedFinal === false, mediaOnly);
+
+const mailbox = ensureMailbox();
+const stats = mailbox.stats();
+check("one pending mailbox entry", stats.pending === 1, stats);
+const pending = mailbox.list({ states: ["pending"], limit: 10 });
+const entry = pending.find((item) => item.media.some((media) => media.path === weixinStyle.path));
+check("entry carries media[].path", entry !== undefined, pending);
+check("entry has no text", entry?.text === "", entry?.text);
+check("entry keeps the channel id", entry?.channel === "openclaw-weixin", entry?.channel);
+
+if (entry) mailbox.ack(entry.id, { force: true });
+check("ack clears the pending entry", mailbox.stats().pending === 0, mailbox.stats());
+resetMailbox();
+
+// The old guard still applies when there is neither text nor media.
+const empty = await dispatch({
+  ctx: { ...baseCtx },
+  cfg: { liteGateway: { agentType: "mailbox" } },
+  dispatcher,
+});
+check("empty text and media is a no-op", empty.queuedFinal === false, empty);
+check("no mailbox entry for an empty message", ensureMailbox().stats().pending === 0);
+resetMailbox();
 
 // ── Cleanup ────────────────────────────────────────────────────────────────
 delete process.env.OCG_CONFIG_PATH;

@@ -25,7 +25,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { dispatchInbound } from "../inbound.js";
+import { dispatchInbound, extractInboundMedia } from "../inbound.js";
 import { resolveMediaDir } from "../config.js";
 import type { DeliverFn } from "../reply-chunking.js";
 
@@ -378,8 +378,15 @@ async function dispatchReplyFromConfig(params: {
     "";
 
   if (!body.trim()) {
-    dispatcher.markComplete();
-    return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
+    // Media-only messages (WeChat images/voice/files without a caption) have
+    // no Body but must still reach the transport — the mailbox entry carries
+    // `media[].path`. Only drop when there is neither text nor media.
+    const media = extractInboundMedia(ctx);
+    if (media.length === 0) {
+      dispatcher.markComplete();
+      return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
+    }
+    console.log(`[ocg] dispatchReplyFromConfig media-only (${media.length} item(s)), continuing`);
   }
 
   // Adapt the dispatcher into a single deliver function. The dispatcher applies
